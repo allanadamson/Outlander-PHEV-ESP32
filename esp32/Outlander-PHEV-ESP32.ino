@@ -55,7 +55,14 @@ PHEVState phev;
 bool haveCommandXor = false;
 uint8_t lastCommandXor = 0x00;
 
-bool phevCoreCheckIncomingCommand(uint8_t command)
+struct PhevCoreMessage
+{
+    uint8_t data[256];
+    uint8_t length = 0;
+    uint8_t xorValue = 0;
+};
+
+bool phev_core_checkIncomingCommand(const uint8_t command)
 {
     switch (command)
     {
@@ -74,6 +81,20 @@ bool phevCoreCheckIncomingCommand(uint8_t command)
     }
 }
 
+uint8_t phev_core_checksum(const uint8_t *data)
+{
+    uint8_t checksum = 0;
+    int length = data[1] + 2;
+
+    for (int i = 0;; i++)
+    {
+        if (i >= length - 1)
+            return checksum;
+
+        checksum = (uint8_t)(data[i] + checksum);
+    }
+}
+
 void xorPacket(const uint8_t *input,
                uint8_t *output,
                size_t length,
@@ -85,74 +106,154 @@ void xorPacket(const uint8_t *input,
     }
 }
 
-bool phevCoreValidateChecksumBounded(const uint8_t *data,
-                                     size_t available,
-                                     uint8_t xorValue,
-                                     uint8_t *decodedLength)
+bool phev_core_xorDataWithValueBounded(const uint8_t *data,
+                                       const uint8_t xorValue,
+                                       const size_t bufLen,
+                                       PhevCoreMessage &decoded)
 {
-    if (available < 3)
+    if (bufLen < 2)
         return false;
 
     uint8_t length = (data[1] ^ xorValue) + 2;
 
-    if (length < 3 || length > available)
+    if (length > bufLen || length > sizeof(decoded.data))
         return false;
 
-    uint8_t sum = 0;
+    xorPacket(data, decoded.data, length, xorValue);
+    decoded.length = length;
+    decoded.xorValue = xorValue;
 
-    for (uint8_t i = 0; i < length - 1; i++)
-    {
-        sum += data[i] ^ xorValue;
-    }
-
-    if (sum != (data[length - 1] ^ xorValue))
-        return false;
-
-    *decodedLength = length;
     return true;
 }
 
-bool phevCoreExtractIncomingPacket(const uint8_t *data,
-                                   size_t available,
-                                   uint8_t *decoded,
-                                   uint8_t *decodedLength,
-                                   uint8_t *xorValue)
+bool phev_core_validateChecksum(const uint8_t *data)
 {
-    uint8_t candidateXor = 0;
-    uint8_t length = 0;
+    uint8_t length = data[1] + 2;
+    uint8_t messageChecksum = data[length - 1];
+    uint8_t calculatedChecksum = phev_core_checksum(data);
 
-    if (phevCoreCheckIncomingCommand(data[0]) &&
-        phevCoreValidateChecksumBounded(data, available, candidateXor, &length))
+    return calculatedChecksum == messageChecksum;
+}
+
+bool phev_core_validateChecksumXORBounded(const uint8_t *data,
+                                          const uint8_t xorValue,
+                                          const size_t bufLen)
+{
+    PhevCoreMessage decoded;
+
+    if (!phev_core_xorDataWithValueBounded(data, xorValue, bufLen, decoded))
+        return false;
+
+    return phev_core_validateChecksum(decoded.data);
+}
+
+bool phev_core_createMsgXOR(const uint8_t *data,
+                            const size_t length,
+                            const uint8_t xorValue,
+                            PhevCoreMessage &message)
+{
+    if (length > sizeof(message.data))
+        return false;
+
+    memcpy(message.data, data, length);
+    message.length = length;
+    message.xorValue = xorValue;
+
+    return true;
+}
+
+bool phev_core_unencodedIncomingMessage(const uint8_t *data,
+                                        PhevCoreMessage &message)
+{
+    uint8_t command = data[0];
+    uint8_t length = data[1] + 2;
+
+    if (phev_core_validateChecksum(data))
     {
-        memcpy(decoded, data, length);
-        *decodedLength = length;
-        *xorValue = candidateXor;
-        return true;
-    }
-
-    candidateXor = data[2];
-
-    if (phevCoreValidateChecksumBounded(data, available, candidateXor, &length) &&
-        phevCoreCheckIncomingCommand(data[0] ^ candidateXor))
-    {
-        xorPacket(data, decoded, length, candidateXor);
-        *decodedLength = length;
-        *xorValue = candidateXor;
-        return true;
-    }
-
-    candidateXor ^= 1;
-
-    if (phevCoreValidateChecksumBounded(data, available, candidateXor, &length) &&
-        phevCoreCheckIncomingCommand(data[0] ^ candidateXor))
-    {
-        xorPacket(data, decoded, length, candidateXor);
-        *decodedLength = length;
-        *xorValue = candidateXor;
-        return true;
+        switch (command)
+        {
+        case 0x4E:
+        case 0x5E:
+        case 0x3F:
+        case 0x6F:
+        case 0xBB:
+        case 0xCC:
+        case 0x2E:
+        case 0x2F:
+            return phev_core_createMsgXOR(data, length, 0, message);
+        }
     }
 
     return false;
+}
+
+bool phev_core_encodedIncomingMessageBounded(const uint8_t *data,
+                                             const size_t bufLen,
+                                             PhevCoreMessage &message)
+{
+    if (bufLen < 3)
+        return false;
+
+    uint8_t xorValue = data[2];
+    uint8_t command = data[0] ^ xorValue;
+    uint8_t length = (data[1] ^ xorValue) + 2;
+
+    if (length <= bufLen &&
+        phev_core_checkIncomingCommand(command) &&
+        phev_core_validateChecksumXORBounded(data, xorValue, bufLen))
+    {
+        return phev_core_createMsgXOR(data, length, xorValue, message);
+    }
+
+    xorValue ^= 1;
+    command = data[0] ^ xorValue;
+    length = (data[1] ^ xorValue) + 2;
+
+    if (length <= bufLen &&
+        phev_core_checkIncomingCommand(command) &&
+        phev_core_validateChecksumXORBounded(data, xorValue, bufLen))
+    {
+        return phev_core_createMsgXOR(data, length, xorValue, message);
+    }
+
+    return false;
+}
+
+bool phev_core_extractIncomingMessageAndXORBounded(const uint8_t *data,
+                                                   const size_t bufLen,
+                                                   PhevCoreMessage &message)
+{
+    if (bufLen < 3)
+        return false;
+
+    if (phev_core_checkIncomingCommand(data[0]) &&
+        phev_core_validateChecksumXORBounded(data, 0, bufLen))
+    {
+        return phev_core_unencodedIncomingMessage(data, message);
+    }
+
+    return phev_core_encodedIncomingMessageBounded(data, bufLen, message);
+}
+
+bool phev_core_extractAndDecodeIncomingMessageAndXORBounded(const uint8_t *data,
+                                                            const size_t bufLen,
+                                                            PhevCoreMessage &decoded)
+{
+    PhevCoreMessage message;
+
+    if (!phev_core_extractIncomingMessageAndXORBounded(data, bufLen, message))
+        return false;
+
+    if (!phev_core_xorDataWithValueBounded(message.data,
+                                           message.xorValue,
+                                           message.length,
+                                           decoded))
+    {
+        return false;
+    }
+
+    decoded.xorValue = message.xorValue;
+    return true;
 }
 
 void parsePackets(const uint8_t *buffer,
@@ -162,15 +263,11 @@ void parsePackets(const uint8_t *buffer,
 
     while (offset + 3 <= length)
     {
-        uint8_t decoded[256];
-        uint8_t decodedLength = 0;
-        uint8_t xorValue = 0;
+        PhevCoreMessage decoded;
 
-        if (!phevCoreExtractIncomingPacket(buffer + offset,
-                                           length - offset,
-                                           decoded,
-                                           &decodedLength,
-                                           &xorValue))
+        if (!phev_core_extractAndDecodeIncomingMessageAndXORBounded(buffer + offset,
+                                                                    length - offset,
+                                                                    decoded))
         {
             offset++;
             continue;
@@ -178,26 +275,26 @@ void parsePackets(const uint8_t *buffer,
 
         Serial.printf(
             "PHEV PACKET CMD=%02X LEN=%u XOR=%02X\n",
-            decoded[0],
-            decodedLength,
-            xorValue
+            decoded.data[0],
+            decoded.length,
+            decoded.xorValue
         );
 
-        if (decoded[0] == 0xBB && decodedLength >= 5)
+        if (decoded.data[0] == 0xBB && decoded.length >= 5)
         {
-            lastCommandXor = decoded[4];
+            lastCommandXor = decoded.data[4];
             haveCommandXor = true;
-            phev.commandXor = decoded[4];
-            phev.pingXor = decoded[4];
+            phev.commandXor = decoded.data[4];
+            phev.pingXor = decoded.data[4];
 
             Serial.printf(
                 "COMMAND_XOR=%02X\n",
                 lastCommandXor
             );
         }
-        else if (decoded[0] == 0xCC && decodedLength >= 5)
+        else if (decoded.data[0] == 0xCC && decoded.length >= 5)
         {
-            phev.pingXor = decoded[4];
+            phev.pingXor = decoded.data[4];
 
             Serial.printf(
                 "PING_XOR=%02X\n",
@@ -205,7 +302,7 @@ void parsePackets(const uint8_t *buffer,
             );
         }
 
-        offset += decodedLength;
+        offset += decoded.length;
     }
 }
 
