@@ -52,6 +52,163 @@ struct PHEVState
 
 PHEVState phev;
 
+bool haveCommandXor = false;
+uint8_t lastCommandXor = 0x00;
+
+bool phevCoreCheckIncomingCommand(uint8_t command)
+{
+    switch (command)
+    {
+        case 0x3F:
+        case 0x6F:
+        case 0x4E:
+        case 0x5E:
+        case 0xBB:
+        case 0xCC:
+        case 0x2F:
+        case 0x2E:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+void xorPacket(const uint8_t *input,
+               uint8_t *output,
+               size_t length,
+               uint8_t xorValue)
+{
+    for (size_t i = 0; i < length; i++)
+    {
+        output[i] = input[i] ^ xorValue;
+    }
+}
+
+bool phevCoreValidateChecksumBounded(const uint8_t *data,
+                                     size_t available,
+                                     uint8_t xorValue,
+                                     uint8_t *decodedLength)
+{
+    if (available < 3)
+        return false;
+
+    uint8_t length = (data[1] ^ xorValue) + 2;
+
+    if (length < 3 || length > available)
+        return false;
+
+    uint8_t sum = 0;
+
+    for (uint8_t i = 0; i < length - 1; i++)
+    {
+        sum += data[i] ^ xorValue;
+    }
+
+    if (sum != (data[length - 1] ^ xorValue))
+        return false;
+
+    *decodedLength = length;
+    return true;
+}
+
+bool phevCoreExtractIncomingPacket(const uint8_t *data,
+                                   size_t available,
+                                   uint8_t *decoded,
+                                   uint8_t *decodedLength,
+                                   uint8_t *xorValue)
+{
+    uint8_t candidateXor = 0;
+    uint8_t length = 0;
+
+    if (phevCoreCheckIncomingCommand(data[0]) &&
+        phevCoreValidateChecksumBounded(data, available, candidateXor, &length))
+    {
+        memcpy(decoded, data, length);
+        *decodedLength = length;
+        *xorValue = candidateXor;
+        return true;
+    }
+
+    candidateXor = data[2];
+
+    if (phevCoreValidateChecksumBounded(data, available, candidateXor, &length) &&
+        phevCoreCheckIncomingCommand(data[0] ^ candidateXor))
+    {
+        xorPacket(data, decoded, length, candidateXor);
+        *decodedLength = length;
+        *xorValue = candidateXor;
+        return true;
+    }
+
+    candidateXor ^= 1;
+
+    if (phevCoreValidateChecksumBounded(data, available, candidateXor, &length) &&
+        phevCoreCheckIncomingCommand(data[0] ^ candidateXor))
+    {
+        xorPacket(data, decoded, length, candidateXor);
+        *decodedLength = length;
+        *xorValue = candidateXor;
+        return true;
+    }
+
+    return false;
+}
+
+void parsePackets(const uint8_t *buffer,
+                  size_t length)
+{
+    size_t offset = 0;
+
+    while (offset + 3 <= length)
+    {
+        uint8_t decoded[256];
+        uint8_t decodedLength = 0;
+        uint8_t xorValue = 0;
+
+        if (!phevCoreExtractIncomingPacket(buffer + offset,
+                                           length - offset,
+                                           decoded,
+                                           &decodedLength,
+                                           &xorValue))
+        {
+            offset++;
+            continue;
+        }
+
+        Serial.printf(
+            "PHEV PACKET CMD=%02X LEN=%u XOR=%02X\n",
+            decoded[0],
+            decodedLength,
+            xorValue
+        );
+
+        if (decoded[0] == 0xBB && decodedLength >= 5)
+        {
+            lastCommandXor = decoded[4];
+            haveCommandXor = true;
+            phev.commandXor = decoded[4];
+            phev.pingXor = decoded[4];
+
+            Serial.printf(
+                "COMMAND_XOR=%02X\n",
+                lastCommandXor
+            );
+        }
+        else if (decoded[0] == 0xCC && decodedLength >= 5)
+        {
+            phev.pingXor = decoded[4];
+
+            Serial.printf(
+                "PING_XOR=%02X\n",
+                phev.pingXor
+            );
+        }
+
+        offset += decodedLength;
+    }
+}
+
 String sendAT(String cmd, int wait = 1500) {
   String response = "";
   Serial2.println(cmd);
