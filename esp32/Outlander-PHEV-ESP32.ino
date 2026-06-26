@@ -63,6 +63,12 @@ struct PhevCoreMessage
     uint8_t xorValue = 0;
 };
 
+void sendPacketWithXor(WiFiClient &client,
+                       const char* label,
+                       const uint8_t* packet,
+                       size_t len,
+                       uint8_t xorValue);
+
 bool phev_core_checkIncomingCommand(const uint8_t command)
 {
     switch (command)
@@ -330,7 +336,8 @@ bool phev_core_extractAndDecodeIncomingMessageAndXORBounded(const uint8_t *data,
     return true;
 }
 
-void parsePackets(const uint8_t *buffer,
+void parsePackets(WiFiClient &client,
+                  const uint8_t *buffer,
                   size_t length)
 {
     size_t offset = 0;
@@ -354,7 +361,52 @@ void parsePackets(const uint8_t *buffer,
             decoded.xorValue
         );
 
-        if (decoded.data[0] == 0xBB && decoded.length >= 5)
+        if ((decoded.data[0] == 0x4E || decoded.data[0] == 0x5E) && decoded.length >= 4)
+        {
+            uint8_t responseCommand =
+                ((decoded.data[0] & 0x0F) << 4) |
+                ((decoded.data[0] & 0xF0) >> 4);
+
+            uint8_t responsePayload = 0x00;
+            uint8_t response[8];
+            size_t responseLength = 0;
+
+            Serial.printf(
+                "PHEV RX START %02X reg=%02X\n",
+                decoded.data[0],
+                decoded.data[3]
+            );
+
+            if (phev_core_encodeRawMessage(responseCommand,
+                                           0x01,
+                                           decoded.data[3],
+                                           &responsePayload,
+                                           1,
+                                           response,
+                                           sizeof(response),
+                                           responseLength))
+            {
+                Serial.printf(
+                    "PHEV TX START ACK cmd=%02X reg=%02X\n",
+                    responseCommand,
+                    decoded.data[3]
+                );
+
+                sendPacketWithXor(client,
+                                  "START ACK",
+                                  response,
+                                  responseLength,
+                                  decoded.xorValue);
+
+                phev.encrypted = true;
+                Serial.println("PHEV ENCRYPT ENABLED");
+            }
+            else
+            {
+                Serial.println("PHEV START ACK BUILD FAIL");
+            }
+        }
+        else if (decoded.data[0] == 0xBB && decoded.length >= 5)
         {
             phev.commandXor = decoded.data[4];
             phev.pingXor = decoded.data[4];
@@ -588,13 +640,14 @@ for(size_t i = 0; i < count; i++)
 }
 Serial.printf("COUNT=%u\n", count);
 
-parsePackets(buffer, count);
+parsePackets(client, buffer, count);
 
 return count;
 }
 void connectToCarWiFi();
 
 bool connectCarTcp(WiFiClient &client) {
+  Serial.println("TRACE: connectCarTcp() begin");
   Serial.println("\n--- AUTO TCP CONNECT ---");
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -775,7 +828,9 @@ void sendHeadlightsCommand(bool lightsOn) {
 
   if (!connectCarTcp(client)) return;
 
+  Serial.println("TRACE: before sendPhevInit()");
   sendPhevInit(client);
+  Serial.println("TRACE: after sendPhevInit()");
 
 Serial.println("INIT DONE - WATCHING");
 
@@ -851,6 +906,7 @@ void subscribeMQTT() {
 }
 
 void connectToMQTT() {
+  Serial.println("TRACE: connectToMQTT() begin");
   Serial.println("\n--- MQTT CONNECT ---");
 
   sendAT("AT+CMQTTSTART", 5000);
@@ -869,6 +925,8 @@ void connectToMQTT() {
   } else {
     Serial.println("MQTT CONNECT FAIL");
   }
+
+  Serial.println("TRACE: connectToMQTT() end");
 }
 
 void testTCPPort() {
@@ -885,6 +943,7 @@ void testTCPPort() {
 }
 
 void connectToCarWiFi() {
+  Serial.println("TRACE: connectToCarWiFi() begin");
   Serial.println("\n--- AUTO WIFI CONNECT ---");
 
   WiFi.mode(WIFI_STA);
@@ -927,6 +986,8 @@ void connectToCarWiFi() {
   } else {
     Serial.println("AUTO WIFI FAILED");
   }
+
+  Serial.println("TRACE: connectToCarWiFi() end");
 }
 
 void handleModemData(String resp) {
@@ -948,7 +1009,11 @@ void handleModemData(String resp) {
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("TRACE: setup() begin");
+
+  Serial.println("TRACE: Serial2/modem init begin");
   Serial2.begin(115200, SERIAL_8N1, PIN_RX, PIN_TX);
+  Serial.println("TRACE: Serial2/modem init end");
 
   pinMode(PWR_PIN, OUTPUT);
 
@@ -963,14 +1028,42 @@ void setup() {
   sendAT("AT+CGDCONT=1,\"IP\",\"internet.emt.ee\"", 2000);
   sendAT("AT+CGACT=1,1", 5000);
 
+  Serial.println("TRACE: MQTT connect sequence begin");
   connectToMQTT();
+  Serial.println("TRACE: MQTT connect sequence end");
+
+  Serial.println("TRACE: WiFi connect sequence begin");
   connectToCarWiFi();
+  Serial.println("TRACE: WiFi connect sequence end");
+
   testTCPPort();
+
+  Serial.println("TRACE: setup() end - PHEV handshake is not called in setup()");
+  Serial.println("TRACE: PHEV handshake is called only after LIGHTS_ON or LIGHTS_OFF modem/MQTT data");
 }
 
 void loop() {
+  static bool loopTracePrinted = false;
+
+  if (!loopTracePrinted) {
+    loopTracePrinted = true;
+    Serial.println("TRACE: loop() begin - waiting for Serial2 MQTT command before PHEV handshake");
+  }
+
   if (Serial.available()) {
-    Serial2.write(Serial.read());
+    String usbCmd = Serial.readStringUntil('\n');
+    usbCmd.trim();
+
+    if (usbCmd == "LIGHTS_ON") {
+      Serial.println("\n[USB TEST] LIGHTS ON");
+      sendHeadlightsOn();
+    } else if (usbCmd == "LIGHTS_OFF") {
+      Serial.println("\n[USB TEST] LIGHTS OFF");
+      sendHeadlightsOff();
+    } else {
+      Serial2.print(usbCmd);
+      Serial2.print("\n");
+    }
   }
 
   if (Serial2.available()) {
