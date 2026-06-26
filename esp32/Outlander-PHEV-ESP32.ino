@@ -360,7 +360,7 @@ void parsePackets(const uint8_t *buffer,
             phev.pingXor = decoded.data[4];
 
             Serial.printf(
-                "COMMAND_XOR=%02X\n",
+                "PHEV RX BB COMMAND_XOR=%02X\n",
                 phev.commandXor
             );
         }
@@ -369,7 +369,7 @@ void parsePackets(const uint8_t *buffer,
             phev.pingXor = decoded.data[4];
 
             Serial.printf(
-                "PING_XOR=%02X\n",
+                "PHEV RX CC PING_XOR=%02X\n",
                 phev.pingXor
             );
         }
@@ -378,13 +378,19 @@ void parsePackets(const uint8_t *buffer,
             phev.pingResponse = decoded.data[3];
 
             Serial.printf(
-                "PING_RESPONSE=%02X\n",
+                "PHEV RX PING_RESPONSE 3F=%02X\n",
                 phev.pingResponse
             );
         }
 
-        if (decoded.xorValue != 0)
+        if (decoded.xorValue != 0 && decoded.xorValue != phev.currentXor)
         {
+            Serial.printf(
+                "PHEV CURRENT_XOR %02X -> %02X\n",
+                phev.currentXor,
+                decoded.xorValue
+            );
+
             phev.currentXor = decoded.xorValue;
         }
 
@@ -409,6 +415,12 @@ void phev_pipe_resetConnection(PHEVState &ctx)
     ctx.rxLength = 0;
 
     phev_pipe_resetPing(ctx);
+
+    Serial.printf(
+        "PHEV STATE reset connected=%d encrypted=%d\n",
+        ctx.connected,
+        ctx.encrypted
+    );
 }
 
 String sendAT(String cmd, int wait = 1500) {
@@ -518,6 +530,9 @@ void phev_pipe_sendMac(WiFiClient &client, uint8_t *mac)
     uint8_t message[32];
     size_t length = 0;
 
+    Serial.println("PHEV TX START message");
+    Serial.println("PHEV TX AA message");
+
     if (!phev_core_startMessageEncoded(mac, message, sizeof(message), length))
     {
         Serial.println("PHEV START BUILD FAIL");
@@ -594,6 +609,11 @@ bool connectCarTcp(WiFiClient &client) {
     if (client.connect(auto_IP, auto_port)) {
       Serial.println("TCP CONNECT OK");
       phev.connected = true;
+      Serial.printf(
+        "PHEV STATE connected=%d encrypted=%d\n",
+        phev.connected,
+        phev.encrypted
+      );
       return true;
     }
 
@@ -602,11 +622,23 @@ bool connectCarTcp(WiFiClient &client) {
 
   Serial.println("TCP CONNECT FAIL");
   phev.connected = false;
+  Serial.printf(
+    "PHEV STATE connected=%d encrypted=%d\n",
+    phev.connected,
+    phev.encrypted
+  );
   return false;
 }
 
 void sendPhevInit(WiFiClient &client) {
   uint8_t buffer[1024];
+
+  Serial.println("PHEV HANDSHAKE START");
+  Serial.printf(
+    "PHEV STATE connected=%d encrypted=%d\n",
+    phev.connected,
+    phev.encrypted
+  );
 
   phev_pipe_sendMac(client, registered_mac);
   readResponseToBuffer(client, "RESP START", 3000, buffer, sizeof(buffer));
@@ -629,9 +661,11 @@ void sendPhevInit(WiFiClient &client) {
     phev.encrypted = true;
 
     Serial.printf(
-      "PHEV HANDSHAKE OK COMMAND_XOR=%02X PING_XOR=%02X\n",
+      "PHEV HANDSHAKE OK COMMAND_XOR=%02X PING_XOR=%02X connected=%d encrypted=%d\n",
       phev.commandXor,
-      phev.pingXor
+      phev.pingXor,
+      phev.connected,
+      phev.encrypted
     );
   }
   else
@@ -646,6 +680,12 @@ void sendRawPingAndRead(WiFiClient &client, int waitMs) {
   uint8_t rawPing[] = {
     0xF6, 0x04, 0x00, 0x06, 0x03, 0x03
   };
+
+  Serial.printf(
+    "PHEV TX PING counter=%u pingXor=%02X\n",
+    phev.pingCounter,
+    phev.pingXor
+  );
 
   phev_pipe_pingOutboundPublish(client, "SEND RAW PING", rawPing, sizeof(rawPing));
   readResponseToBuffer(client, "RESP RAW PING", waitMs, buffer, sizeof(buffer));
@@ -687,6 +727,12 @@ void sendXorCommandPair(WiFiClient &client, bool lightsOn)
     };
 
     Serial.printf("USING COMMAND_XOR=%02X\n", phev.commandXor);
+
+    Serial.printf(
+        "PHEV TX PING counter=%u pingXor=%02X\n",
+        phev.pingCounter,
+        phev.pingXor
+    );
 
     phev_pipe_pingOutboundPublish(
         client,
@@ -770,6 +816,11 @@ while (millis() < endTime)
 
 client.stop();
 phev.connected = false;
+Serial.printf(
+    "PHEV STATE connected=%d encrypted=%d\n",
+    phev.connected,
+    phev.encrypted
+);
 Serial.println("TCP CLOSED");
 return;
 }
