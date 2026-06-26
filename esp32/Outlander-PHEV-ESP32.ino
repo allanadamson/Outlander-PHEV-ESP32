@@ -33,6 +33,8 @@ uint8_t registered_mac[] = {
 #define PWR_PIN 4
 
 #define KO_WF_EV_UPDATE_SP 0x06
+#define PING_SEND_CMD_MY18 0xF3
+#define PHEV_PING_INTERVAL_MS 1000
 
 // =====================================================
 // PHEV protocol state
@@ -49,6 +51,8 @@ struct PHEVState
 
     uint8_t pingCounter = 1;
     uint8_t pingResponse = 0;
+
+    bool pendingEvUpdate = false;
 
     uint32_t lastPing = 0;
 
@@ -70,6 +74,9 @@ void sendPacketWithXor(WiFiClient &client,
                        const uint8_t* packet,
                        size_t len,
                        uint8_t xorValue);
+void phev_pipe_sendEvUpdate(WiFiClient &client);
+void phev_pipe_ping(WiFiClient &client);
+void phev_pipe_loopMinimal(WiFiClient &client);
 
 bool phev_core_checkIncomingCommand(const uint8_t command)
 {
@@ -363,6 +370,15 @@ void parsePackets(WiFiClient &client,
             decoded.xorValue
         );
 
+        if (decoded.length >= 4 &&
+            decoded.data[2] == 0x01 &&
+            decoded.data[3] == KO_WF_EV_UPDATE_SP &&
+            phev.pendingEvUpdate)
+        {
+            phev.pendingEvUpdate = false;
+            Serial.println("PHEV EV_UPDATE ACK received");
+        }
+
         if ((decoded.data[0] == 0x4E || decoded.data[0] == 0x5E) && decoded.length >= 4)
         {
             uint8_t responseCommand =
@@ -417,6 +433,12 @@ void parsePackets(WiFiClient &client,
                 "PHEV RX BB COMMAND_XOR=%02X\n",
                 phev.commandXor
             );
+
+            if (phev.pendingEvUpdate)
+            {
+                Serial.println("PHEV EV_UPDATE resend on BB");
+                phev_pipe_sendEvUpdate(client);
+            }
         }
         else if (decoded.data[0] == 0x6F && decoded.length >= 4)
         {
@@ -536,6 +558,7 @@ void phev_pipe_resetConnection(PHEVState &ctx)
     ctx.currentXor = 0;
     ctx.commandXor = 0;
     ctx.pingXor = 0;
+    ctx.pendingEvUpdate = false;
     ctx.rxLength = 0;
 
     phev_pipe_resetPing(ctx);
@@ -708,6 +731,77 @@ void phev_pipe_sendEvUpdate(WiFiClient &client)
     Serial.println();
 
     phev_pipe_commandOutboundPublish(client, "EV_UPDATE", raw, length);
+    phev.pendingEvUpdate = true;
+    Serial.println("PHEV EV_UPDATE pending=1");
+}
+
+void phev_pipe_ping(WiFiClient &client)
+{
+    if (phev.encrypted && phev.pingXor == 0)
+    {
+        Serial.println("PHEV PING skipped waiting for pingXor");
+        return;
+    }
+
+    uint8_t payload = 0x00;
+    uint8_t raw[8];
+    uint8_t encoded[8];
+    size_t length = 0;
+    uint8_t counter = phev.pingCounter;
+
+    if (!phev_core_encodeRawMessage(PING_SEND_CMD_MY18,
+                                    0x00,
+                                    counter,
+                                    &payload,
+                                    1,
+                                    raw,
+                                    sizeof(raw),
+                                    length))
+    {
+        Serial.println("PHEV PING BUILD FAIL");
+        return;
+    }
+
+    phev_core_xorDataOutbound(raw, encoded, length, phev.pingXor);
+
+    Serial.printf(
+        "PHEV TX PING counter=%u xor=%02X\n",
+        counter,
+        phev.pingXor
+    );
+
+    Serial.print("TX raw: ");
+    for (size_t i = 0; i < length; i++)
+    {
+        Serial.printf("%02X ", raw[i]);
+    }
+    Serial.println();
+
+    Serial.print("TX encoded: ");
+    for (size_t i = 0; i < length; i++)
+    {
+        Serial.printf("%02X ", encoded[i]);
+    }
+    Serial.println();
+
+    phev_pipe_pingOutboundPublish(client, "PING", raw, length);
+
+    phev.pingCounter++;
+    phev.pingCounter %= 0x30;
+}
+
+void phev_pipe_loopMinimal(WiFiClient &client)
+{
+    if (!client.connected())
+        return;
+
+    uint32_t now = millis();
+
+    if (now - phev.lastPing >= PHEV_PING_INTERVAL_MS)
+    {
+        phev.lastPing = now;
+        phev_pipe_ping(client);
+    }
 }
 
 size_t readResponseToBuffer(WiFiClient &client, const char* label, int waitMs, uint8_t* buffer, size_t maxLen) 
@@ -957,6 +1051,8 @@ unsigned long endTime = millis() + 60000;
 
 while (millis() < endTime)
 {
+    phev_pipe_loopMinimal(client);
+
     if(client.available())
     {
         readResponseToBuffer(
