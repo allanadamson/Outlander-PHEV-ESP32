@@ -56,7 +56,7 @@ struct PHEVState
 
     uint32_t lastPing = 0;
 
-    uint8_t rxBuffer[1024];
+    uint8_t rxBuffer[2048];
     size_t rxLength = 0;
 };
 
@@ -345,23 +345,144 @@ bool phev_core_extractAndDecodeIncomingMessageAndXORBounded(const uint8_t *data,
     return true;
 }
 
+void phev_logRawMarkers(const uint8_t *buffer,
+                        size_t length,
+                        size_t baseOffset)
+{
+    for (size_t i = 0; i < length; i++)
+    {
+        switch (buffer[i])
+        {
+            case 0xBB:
+            case 0xCC:
+            case 0xCD:
+            case 0xBA:
+            case 0x2F:
+                Serial.printf(
+                    "RX RAW MARKER %02X at %u\n",
+                    buffer[i],
+                    (unsigned)(baseOffset + i)
+                );
+                break;
+
+            default:
+                break;
+        }
+    }
+}
+
+bool phev_rxLooksPartialPacket(const uint8_t *buffer,
+                               size_t length)
+{
+    if (length < 3)
+        return true;
+
+    if (phev_core_checkIncomingCommand(buffer[0]))
+    {
+        size_t packetLength = buffer[1] + 2;
+
+        if (packetLength > length)
+            return true;
+    }
+
+    uint8_t xorValue = buffer[2];
+    uint8_t command = buffer[0] ^ xorValue;
+    size_t packetLength = (buffer[1] ^ xorValue) + 2;
+
+    if (phev_core_checkIncomingCommand(command) && packetLength > length)
+        return true;
+
+    xorValue ^= 1;
+    command = buffer[0] ^ xorValue;
+    packetLength = (buffer[1] ^ xorValue) + 2;
+
+    if (phev_core_checkIncomingCommand(command) && packetLength > length)
+        return true;
+
+    return false;
+}
+
 void parsePackets(WiFiClient &client,
                   const uint8_t *buffer,
                   size_t length)
 {
-    size_t offset = 0;
+    if (length == 0)
+        return;
 
-    while (offset + 3 <= length)
+    phev_logRawMarkers(buffer, length, phev.rxLength);
+
+    if (length > sizeof(phev.rxBuffer))
+    {
+        buffer += length - sizeof(phev.rxBuffer);
+        length = sizeof(phev.rxBuffer);
+        phev.rxLength = 0;
+    }
+
+    if (phev.rxLength + length > sizeof(phev.rxBuffer))
+    {
+        size_t drop = (phev.rxLength + length) - sizeof(phev.rxBuffer);
+
+        if (drop > phev.rxLength)
+            drop = phev.rxLength;
+
+        for (size_t i = 0; i < drop; i++)
+        {
+            Serial.printf(
+                "RX DROP byte=%02X reason=buffer overflow\n",
+                phev.rxBuffer[i]
+            );
+        }
+
+        memmove(phev.rxBuffer,
+                phev.rxBuffer + drop,
+                phev.rxLength - drop);
+        phev.rxLength -= drop;
+    }
+
+    memcpy(phev.rxBuffer + phev.rxLength, buffer, length);
+    phev.rxLength += length;
+
+    Serial.printf(
+        "RX APPEND len=%u total=%u\n",
+        (unsigned)length,
+        (unsigned)phev.rxLength
+    );
+
+    while (phev.rxLength > 0)
     {
         PhevCoreMessage decoded;
 
-        if (!phev_core_extractAndDecodeIncomingMessageAndXORBounded(buffer + offset,
-                                                                    length - offset,
+        if (!phev_core_extractAndDecodeIncomingMessageAndXORBounded(phev.rxBuffer,
+                                                                    phev.rxLength,
                                                                     decoded))
         {
-            offset++;
+            if (phev_rxLooksPartialPacket(phev.rxBuffer, phev.rxLength))
+            {
+                Serial.printf(
+                    "RX WAIT partial total=%u\n",
+                    (unsigned)phev.rxLength
+                );
+                break;
+            }
+
+            Serial.printf(
+                "RX DROP byte=%02X reason=no packet start\n",
+                phev.rxBuffer[0]
+            );
+
+            memmove(phev.rxBuffer,
+                    phev.rxBuffer + 1,
+                    phev.rxLength - 1);
+            phev.rxLength--;
             continue;
         }
+
+        Serial.printf(
+            "RX PACKET complete len=%u cmd=%02X xor=%02X\n",
+            decoded.length,
+            decoded.data[0],
+            decoded.xorValue
+        );
 
         Serial.printf(
             "PHEV PACKET CMD=%02X LEN=%u XOR=%02X\n",
@@ -540,7 +661,10 @@ void parsePackets(WiFiClient &client,
             phev.currentXor = decoded.xorValue;
         }
 
-        offset += decoded.length;
+        memmove(phev.rxBuffer,
+                phev.rxBuffer + decoded.length,
+                phev.rxLength - decoded.length);
+        phev.rxLength -= decoded.length;
     }
 }
 
