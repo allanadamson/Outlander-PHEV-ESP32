@@ -32,6 +32,8 @@ uint8_t registered_mac[] = {
 #define PIN_RX 27
 #define PWR_PIN 4
 
+#define KO_WF_EV_UPDATE_SP 0x06
+
 // =====================================================
 // PHEV protocol state
 // =====================================================
@@ -416,6 +418,76 @@ void parsePackets(WiFiClient &client,
                 phev.commandXor
             );
         }
+        else if (decoded.data[0] == 0x6F && decoded.length >= 4)
+        {
+            Serial.printf(
+                "PHEV RX COMMAND 6F type=%02X reg=%02X xor=%02X\n",
+                decoded.data[2],
+                decoded.data[3],
+                decoded.xorValue
+            );
+
+            if (decoded.data[2] == 0x00)
+            {
+                uint8_t responseCommand =
+                    ((decoded.data[0] & 0x0F) << 4) |
+                    ((decoded.data[0] & 0xF0) >> 4);
+
+                uint8_t responsePayload = 0x00;
+                uint8_t responseRaw[8];
+                size_t responseLength = 0;
+
+                if (phev_core_encodeRawMessage(responseCommand,
+                                               0x01,
+                                               decoded.data[3],
+                                               &responsePayload,
+                                               1,
+                                               responseRaw,
+                                               sizeof(responseRaw),
+                                               responseLength))
+                {
+                    uint8_t responseWithMessageXor[8];
+                    uint8_t responseEncoded[8];
+
+                    phev_core_xorDataOutbound(responseRaw,
+                                              responseWithMessageXor,
+                                              responseLength,
+                                              decoded.xorValue);
+
+                    phev_core_xorDataOutbound(responseWithMessageXor,
+                                              responseEncoded,
+                                              responseLength,
+                                              phev.commandXor);
+
+                    Serial.printf(
+                        "PHEV TX COMMAND ACK F6 reg=%02X xor=%02X\n",
+                        decoded.data[3],
+                        phev.commandXor
+                    );
+
+                    Serial.print("TX raw: ");
+                    for (size_t i = 0; i < responseLength; i++)
+                    {
+                        Serial.printf("%02X ", responseRaw[i]);
+                    }
+                    Serial.println();
+
+                    Serial.print("TX encoded: ");
+                    for (size_t i = 0; i < responseLength; i++)
+                    {
+                        Serial.printf("%02X ", responseEncoded[i]);
+                    }
+                    Serial.println();
+
+                    client.write(responseEncoded, responseLength);
+                    client.flush();
+                }
+                else
+                {
+                    Serial.println("PHEV COMMAND ACK BUILD FAIL");
+                }
+            }
+        }
         else if (decoded.data[0] == 0xCC && decoded.length >= 5)
         {
             phev.pingXor = decoded.data[4];
@@ -594,6 +666,50 @@ void phev_pipe_sendMac(WiFiClient &client, uint8_t *mac)
     phev_pipe_outboundPublish(client, "START MAC + AA", message, length);
 }
 
+void phev_pipe_sendEvUpdate(WiFiClient &client)
+{
+    uint8_t payload = 0x03;
+    uint8_t raw[8];
+    uint8_t encoded[8];
+    size_t length = 0;
+
+    if (!phev_core_encodeRawMessage(0xF6,
+                                    0x00,
+                                    KO_WF_EV_UPDATE_SP,
+                                    &payload,
+                                    1,
+                                    raw,
+                                    sizeof(raw),
+                                    length))
+    {
+        Serial.println("PHEV EV_UPDATE BUILD FAIL");
+        return;
+    }
+
+    phev_core_xorDataOutbound(raw, encoded, length, phev.commandXor);
+
+    Serial.printf(
+        "PHEV TX EV_UPDATE reg=%02X value=03\n",
+        KO_WF_EV_UPDATE_SP
+    );
+
+    Serial.print("TX raw: ");
+    for (size_t i = 0; i < length; i++)
+    {
+        Serial.printf("%02X ", raw[i]);
+    }
+    Serial.println();
+
+    Serial.print("TX encoded: ");
+    for (size_t i = 0; i < length; i++)
+    {
+        Serial.printf("%02X ", encoded[i]);
+    }
+    Serial.println();
+
+    phev_pipe_commandOutboundPublish(client, "EV_UPDATE", raw, length);
+}
+
 size_t readResponseToBuffer(WiFiClient &client, const char* label, int waitMs, uint8_t* buffer, size_t maxLen) 
   {
   size_t count = 0;
@@ -694,6 +810,7 @@ void sendPhevInit(WiFiClient &client) {
   );
 
   phev_pipe_sendMac(client, registered_mac);
+  phev_pipe_sendEvUpdate(client);
   readResponseToBuffer(client, "RESP START", 3000, buffer, sizeof(buffer));
 
   unsigned long endTime = millis() + 7000;
