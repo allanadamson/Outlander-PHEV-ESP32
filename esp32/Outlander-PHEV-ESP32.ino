@@ -1,3 +1,6 @@
+struct PHEVState;
+struct PhevCoreMessage;
+
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <esp_wifi.h>
@@ -43,6 +46,7 @@ struct PHEVState
     uint8_t pingXor = 0;
 
     uint8_t pingCounter = 1;
+    uint8_t pingResponse = 0;
 
     uint32_t lastPing = 0;
 
@@ -155,6 +159,79 @@ bool phev_core_createMsgXOR(const uint8_t *data,
     memcpy(message.data, data, length);
     message.length = length;
     message.xorValue = xorValue;
+
+    return true;
+}
+
+bool phev_core_encodeRawMessage(uint8_t command,
+                                uint8_t type,
+                                uint8_t reg,
+                                const uint8_t *payload,
+                                uint8_t payloadLength,
+                                uint8_t *output,
+                                size_t outputSize,
+                                size_t &outputLength)
+{
+    uint8_t packetLength = payloadLength + 3;
+    outputLength = packetLength + 2;
+
+    if (outputLength > outputSize)
+        return false;
+
+    output[0] = command;
+    output[1] = packetLength;
+    output[2] = type;
+    output[3] = reg;
+
+    if (payloadLength > 0 && payload != NULL)
+    {
+        memcpy(output + 4, payload, payloadLength);
+    }
+
+    output[outputLength - 1] = phev_core_checksum(output);
+
+    return true;
+}
+
+bool phev_core_startMessageEncoded(const uint8_t *mac,
+                                   uint8_t *output,
+                                   size_t outputSize,
+                                   size_t &outputLength)
+{
+    uint8_t startPayload[7];
+    memcpy(startPayload, mac, 6);
+    startPayload[6] = 0;
+
+    size_t startLength = 0;
+
+    if (!phev_core_encodeRawMessage(0xE5,
+                                    0x00,
+                                    0x01,
+                                    startPayload,
+                                    sizeof(startPayload),
+                                    output,
+                                    outputSize,
+                                    startLength))
+    {
+        return false;
+    }
+
+    const uint8_t aaPayload = 0;
+    size_t aaLength = 0;
+
+    if (!phev_core_encodeRawMessage(0xF6,
+                                    0x00,
+                                    0xAA,
+                                    &aaPayload,
+                                    1,
+                                    output + startLength,
+                                    outputSize - startLength,
+                                    aaLength))
+    {
+        return false;
+    }
+
+    outputLength = startLength + aaLength;
 
     return true;
 }
@@ -296,9 +373,42 @@ void parsePackets(const uint8_t *buffer,
                 phev.pingXor
             );
         }
+        else if (decoded.data[0] == 0x3F && decoded.length >= 4)
+        {
+            phev.pingResponse = decoded.data[3];
+
+            Serial.printf(
+                "PING_RESPONSE=%02X\n",
+                phev.pingResponse
+            );
+        }
+
+        if (decoded.xorValue != 0)
+        {
+            phev.currentXor = decoded.xorValue;
+        }
 
         offset += decoded.length;
     }
+}
+
+void phev_pipe_resetPing(PHEVState &ctx)
+{
+    ctx.pingCounter = 1;
+    ctx.pingResponse = 0;
+    ctx.lastPing = millis();
+}
+
+void phev_pipe_resetConnection(PHEVState &ctx)
+{
+    ctx.connected = false;
+    ctx.encrypted = false;
+    ctx.currentXor = 0;
+    ctx.commandXor = 0;
+    ctx.pingXor = 0;
+    ctx.rxLength = 0;
+
+    phev_pipe_resetPing(ctx);
 }
 
 String sendAT(String cmd, int wait = 1500) {
@@ -336,7 +446,11 @@ inline void xorBuffer(uint8_t *buffer,
     }
 }
 
-void sendPacket(WiFiClient &client, const char* label, const uint8_t* packet, size_t len)
+void sendPacketWithXor(WiFiClient &client,
+                       const char* label,
+                       const uint8_t* packet,
+                       size_t len,
+                       uint8_t xorValue)
 {
     uint8_t out[64];
 
@@ -345,11 +459,11 @@ void sendPacket(WiFiClient &client, const char* label, const uint8_t* packet, si
 
     memcpy(out, packet, len);
 
-    if (phev.commandXor != 0)
+    if (xorValue != 0)
     {
-        phev_core_xorDataOutbound(packet, out, len, phev.commandXor);
+        phev_core_xorDataOutbound(packet, out, len, xorValue);
 
-        Serial.printf("TX XOR=%02X\n", phev.commandXor);
+        Serial.printf("TX XOR=%02X\n", xorValue);
     }
 
     Serial.print(label);
@@ -368,6 +482,49 @@ void sendPacket(WiFiClient &client, const char* label, const uint8_t* packet, si
 
     client.write(out, len);
     client.flush();
+}
+
+void sendPacket(WiFiClient &client, const char* label, const uint8_t* packet, size_t len)
+{
+    sendPacketWithXor(client, label, packet, len, phev.commandXor);
+}
+
+void phev_pipe_outboundPublish(WiFiClient &client,
+                               const char* label,
+                               const uint8_t *packet,
+                               size_t length)
+{
+    sendPacketWithXor(client, label, packet, length, phev.currentXor);
+}
+
+void phev_pipe_pingOutboundPublish(WiFiClient &client,
+                                   const char* label,
+                                   const uint8_t *packet,
+                                   size_t length)
+{
+    sendPacketWithXor(client, label, packet, length, phev.pingXor);
+}
+
+void phev_pipe_commandOutboundPublish(WiFiClient &client,
+                                      const char* label,
+                                      const uint8_t *packet,
+                                      size_t length)
+{
+    sendPacketWithXor(client, label, packet, length, phev.commandXor);
+}
+
+void phev_pipe_sendMac(WiFiClient &client, uint8_t *mac)
+{
+    uint8_t message[32];
+    size_t length = 0;
+
+    if (!phev_core_startMessageEncoded(mac, message, sizeof(message), length))
+    {
+        Serial.println("PHEV START BUILD FAIL");
+        return;
+    }
+
+    phev_pipe_outboundPublish(client, "START MAC + AA", message, length);
 }
 
 size_t readResponseToBuffer(WiFiClient &client, const char* label, int waitMs, uint8_t* buffer, size_t maxLen) 
@@ -436,6 +593,7 @@ bool connectCarTcp(WiFiClient &client) {
 
     if (client.connect(auto_IP, auto_port)) {
       Serial.println("TCP CONNECT OK");
+      phev.connected = true;
       return true;
     }
 
@@ -443,98 +601,43 @@ bool connectCarTcp(WiFiClient &client) {
   }
 
   Serial.println("TCP CONNECT FAIL");
+  phev.connected = false;
   return false;
 }
 
 void sendPhevInit(WiFiClient &client) {
   uint8_t buffer[1024];
 
-  uint8_t init1[] = {
-  0xF2, 0x0A, 0x00, 0x01,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00,
-  0xFD
-};
+  phev_pipe_sendMac(client, registered_mac);
+  readResponseToBuffer(client, "RESP START", 3000, buffer, sizeof(buffer));
 
-  uint8_t init2[] = {
-    0xF6, 0x04, 0x00, 0xAA, 0x00, 0xA4
-  };
+  unsigned long endTime = millis() + 7000;
 
-  uint8_t init3[] = {
-    0xF6, 0x04, 0x00, 0x06, 0x03, 0x03
-  };
-
-sendPacket(client, "INIT 1 MAC", init1, sizeof(init1));
-readResponseToBuffer(client, "RESP INIT 1", 2000, buffer, sizeof(buffer));
-
-sendPacket(client, "INIT 2 AA", init2, sizeof(init2));
-readResponseToBuffer(client, "RESP INIT 2", 3000, buffer, sizeof(buffer));
-
-sendPacket(client, "INIT 3", init3, sizeof(init3));
-readResponseToBuffer(client, "RESP INIT 3", 3000, buffer, sizeof(buffer));
-
-uint8_t reg1[] = {0xF3,0x04,0x00,0x01,0x00,0xF8};
-uint8_t reg2[] = {0xF3,0x04,0x00,0x02,0x00,0xF9};
-uint8_t reg3[] = {0xF3,0x04,0x00,0x03,0x00,0xFA};
-
-sendPacket(client, "REG1", reg1, sizeof(reg1));
-readResponseToBuffer(client, "RESP REG1", 3000, buffer, sizeof(buffer));
-
-sendPacket(client, "REG2", reg2, sizeof(reg2));
-readResponseToBuffer(client, "RESP REG2", 3000, buffer, sizeof(buffer));
-
-sendPacket(client, "REG3", reg3, sizeof(reg3));
-readResponseToBuffer(client, "RESP REG3", 3000, buffer, sizeof(buffer));
-
-sendPacket(client, "REG3", reg3, sizeof(reg3));
-readResponseToBuffer(client, "RESP REG3", 3000, buffer, sizeof(buffer));
-
-delay(3000);
-
-uint8_t e4[] = {0xE4,0x04,0x01,0x01,0x00,0xEA};
-
-for(int i=0;i<3;i++)
-{
-    sendPacket(client, "E4", e4, sizeof(e4));
-
-    size_t count =
-        readResponseToBuffer(
-            client,
-            "RESP E4",
-            3000,
-            buffer,
-            sizeof(buffer)
-        );
-
-    if(phev.commandXor != 0)
+  while (millis() < endTime && phev.commandXor == 0)
+  {
+    if (client.available())
     {
-        Serial.printf(
-            "CURRENT XOR = %02X\n",
-            phev.commandXor
-        );
-    }
-    else
-    {
-        Serial.println("NO XOR FOUND");
+      readResponseToBuffer(client, "RESP HANDSHAKE", 500, buffer, sizeof(buffer));
     }
 
-    Serial.println("\nRAW E4 RESPONSE:");
+    delay(50);
+  }
 
-    for(size_t j = 0; j < count; j++)
-    {
-        Serial.printf("%02X ", buffer[j]);
-    }
+  if (phev.commandXor != 0)
+  {
+    phev.connected = true;
+    phev.encrypted = true;
 
-    Serial.println("\n");
-}
-
-readResponseToBuffer(
-  client,
-  "RESP REGISTER DISP",
-  3000,
-  buffer,
-  sizeof(buffer)
-);
+    Serial.printf(
+      "PHEV HANDSHAKE OK COMMAND_XOR=%02X PING_XOR=%02X\n",
+      phev.commandXor,
+      phev.pingXor
+    );
+  }
+  else
+  {
+    Serial.println("PHEV HANDSHAKE WAITING FOR BB/CC");
+  }
 }
 
 void sendRawPingAndRead(WiFiClient &client, int waitMs) {
@@ -544,7 +647,7 @@ void sendRawPingAndRead(WiFiClient &client, int waitMs) {
     0xF6, 0x04, 0x00, 0x06, 0x03, 0x03
   };
 
-  sendPacket(client, "SEND RAW PING", rawPing, sizeof(rawPing));
+  phev_pipe_pingOutboundPublish(client, "SEND RAW PING", rawPing, sizeof(rawPing));
   readResponseToBuffer(client, "RESP RAW PING", waitMs, buffer, sizeof(buffer));
 }
 
@@ -585,7 +688,7 @@ void sendXorCommandPair(WiFiClient &client, bool lightsOn)
 
     Serial.printf("USING COMMAND_XOR=%02X\n", phev.commandXor);
 
-    sendPacket(
+    phev_pipe_pingOutboundPublish(
         client,
         "SEND XOR PING",
         rawPing,
@@ -600,7 +703,7 @@ void sendXorCommandPair(WiFiClient &client, bool lightsOn)
         sizeof(buffer)
     );
 
-    sendPacket(
+    phev_pipe_commandOutboundPublish(
         client,
         lightsOn ? "SEND XOR LIGHTS ON" : "SEND XOR LIGHTS OFF",
         lightsOn ? rawLightsOn : rawLightsOff,
@@ -622,11 +725,7 @@ void sendHeadlightsCommand(bool lightsOn) {
   WiFiClient client;
   uint8_t buffer[1024];
 
-  phev.connected = false;
-  phev.currentXor = 0x00;
-  phev.commandXor = 0x00;
-  phev.pingXor = 0x00;
-  phev.pingCounter = 1;
+  phev_pipe_resetConnection(phev);
 
   if (!connectCarTcp(client)) return;
 
@@ -670,6 +769,7 @@ while (millis() < endTime)
 }
 
 client.stop();
+phev.connected = false;
 Serial.println("TCP CLOSED");
 return;
 }
