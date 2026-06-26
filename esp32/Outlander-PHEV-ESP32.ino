@@ -52,9 +52,6 @@ struct PHEVState
 
 PHEVState phev;
 
-bool haveCommandXor = false;
-uint8_t lastCommandXor = 0x00;
-
 struct PhevCoreMessage
 {
     uint8_t data[256];
@@ -95,10 +92,10 @@ uint8_t phev_core_checksum(const uint8_t *data)
     }
 }
 
-void xorPacket(const uint8_t *input,
-               uint8_t *output,
-               size_t length,
-               uint8_t xorValue)
+void phev_core_xorDataOutbound(const uint8_t *input,
+                               uint8_t *output,
+                               size_t length,
+                               uint8_t xorValue)
 {
     for (size_t i = 0; i < length; i++)
     {
@@ -119,7 +116,7 @@ bool phev_core_xorDataWithValueBounded(const uint8_t *data,
     if (length > bufLen || length > sizeof(decoded.data))
         return false;
 
-    xorPacket(data, decoded.data, length, xorValue);
+    phev_core_xorDataOutbound(data, decoded.data, length, xorValue);
     decoded.length = length;
     decoded.xorValue = xorValue;
 
@@ -282,14 +279,12 @@ void parsePackets(const uint8_t *buffer,
 
         if (decoded.data[0] == 0xBB && decoded.length >= 5)
         {
-            lastCommandXor = decoded.data[4];
-            haveCommandXor = true;
             phev.commandXor = decoded.data[4];
             phev.pingXor = decoded.data[4];
 
             Serial.printf(
                 "COMMAND_XOR=%02X\n",
-                lastCommandXor
+                phev.commandXor
             );
         }
         else if (decoded.data[0] == 0xCC && decoded.length >= 5)
@@ -350,11 +345,11 @@ void sendPacket(WiFiClient &client, const char* label, const uint8_t* packet, si
 
     memcpy(out, packet, len);
 
-    if (haveCommandXor)
+    if (phev.commandXor != 0)
     {
-        xorPacket(packet, out, len, lastCommandXor);
+        phev_core_xorDataOutbound(packet, out, len, phev.commandXor);
 
-        Serial.printf("TX XOR=%02X\n", lastCommandXor);
+        Serial.printf("TX XOR=%02X\n", phev.commandXor);
     }
 
     Serial.print(label);
@@ -511,11 +506,11 @@ for(int i=0;i<3;i++)
             sizeof(buffer)
         );
 
-    if(haveCommandXor)
+    if(phev.commandXor != 0)
     {
         Serial.printf(
             "CURRENT XOR = %02X\n",
-            lastCommandXor
+            phev.commandXor
         );
     }
     else
@@ -561,7 +556,7 @@ void warmupSession(WiFiClient &client) {
   while (millis() < endTime) {
     sendRawPingAndRead(client, 1200);
 
-    if (haveCommandXor) {
+    if (phev.commandXor != 0) {
       Serial.println("COMMAND_XOR found during warmup");
       return;
     }
@@ -588,7 +583,7 @@ void sendXorCommandPair(WiFiClient &client, bool lightsOn)
         0xF6, 0x04, 0x00, 0x0A, 0x02, 0x06
     };
 
-    Serial.printf("USING COMMAND_XOR=%02X\n", lastCommandXor);
+    Serial.printf("USING COMMAND_XOR=%02X\n", phev.commandXor);
 
     sendPacket(
         client,
@@ -627,8 +622,11 @@ void sendHeadlightsCommand(bool lightsOn) {
   WiFiClient client;
   uint8_t buffer[1024];
 
-  haveCommandXor = false;
-  lastCommandXor = 0x00;
+  phev.connected = false;
+  phev.currentXor = 0x00;
+  phev.commandXor = 0x00;
+  phev.pingXor = 0x00;
+  phev.pingCounter = 1;
 
   if (!connectCarTcp(client)) return;
 
@@ -653,11 +651,11 @@ while (millis() < endTime)
         );
     }
 
-    if(haveCommandXor && !xorSent)
+    if(phev.commandXor != 0 && !xorSent)
     {
         Serial.printf(
             "\nFOUND XOR %02X\n",
-            lastCommandXor
+            phev.commandXor
         );
 
         sendXorCommandPair(
