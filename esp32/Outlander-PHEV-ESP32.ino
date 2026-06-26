@@ -358,12 +358,62 @@ void phev_logRawMarkers(const uint8_t *buffer,
             case 0xCD:
             case 0xBA:
             case 0x2F:
+            {
+                size_t markerOffset = baseOffset + i;
+                size_t windowStart = (i > 16) ? i - 16 : 0;
+                size_t windowEnd = i + 33;
+
+                if (windowEnd > length)
+                    windowEnd = length;
+
                 Serial.printf(
                     "RX RAW MARKER %02X at %u\n",
                     buffer[i],
-                    (unsigned)(baseOffset + i)
+                    (unsigned)markerOffset
                 );
+
+                Serial.printf(
+                    "RX MARKER WINDOW marker=%02X pos=%u:\n",
+                    buffer[i],
+                    (unsigned)markerOffset
+                );
+
+                for (size_t j = windowStart; j < windowEnd; j++)
+                {
+                    Serial.printf("%02X ", buffer[j]);
+                }
+                Serial.println();
+
+                if (i + 2 < length)
+                {
+                    uint8_t data0 = buffer[i];
+                    uint8_t data1 = buffer[i + 1];
+                    uint8_t data2 = buffer[i + 2];
+                    uint8_t xorCandidate = data2;
+                    uint8_t xorCandidateAlt = xorCandidate ^ 1;
+                    uint16_t plainLen = (uint16_t)data1 + 2;
+                    uint8_t decodedCommand = data0 ^ xorCandidate;
+                    uint16_t decodedLen = (uint16_t)(data1 ^ xorCandidate) + 2;
+                    uint8_t decodedCommandAlt = data0 ^ xorCandidateAlt;
+                    uint16_t decodedLenAlt = (uint16_t)(data1 ^ xorCandidateAlt) + 2;
+
+                    Serial.printf("RX MARKER data[0]=%02X\n", data0);
+                    Serial.printf("RX MARKER data[1]=%02X\n", data1);
+                    Serial.printf("RX MARKER data[2]=%02X\n", data2);
+                    Serial.printf("RX MARKER plainLen=%u\n", (unsigned)plainLen);
+                    Serial.printf("RX MARKER xorCandidate=%02X\n", xorCandidate);
+                    Serial.printf("RX MARKER decodedCommand=%02X\n", decodedCommand);
+                    Serial.printf("RX MARKER decodedLen=%u\n", (unsigned)decodedLen);
+                    Serial.printf("RX MARKER decodedCommandAlt=%02X\n", decodedCommandAlt);
+                    Serial.printf("RX MARKER decodedLenAlt=%u\n", (unsigned)decodedLenAlt);
+                }
+                else
+                {
+                    Serial.println("RX MARKER candidate bytes incomplete");
+                }
+
                 break;
+            }
 
             default:
                 break;
