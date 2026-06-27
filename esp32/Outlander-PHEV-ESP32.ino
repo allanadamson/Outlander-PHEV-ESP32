@@ -36,6 +36,7 @@ uint8_t registered_mac[] = {
 #define PING_SEND_CMD_MY18 0xF3
 #define PHEV_PING_INTERVAL_MS 1000
 #define PHEV_HANDSHAKE_WAIT_MS 10000
+#define PHEV_READY_STABLE_MS 800
 
 // =====================================================
 // PHEV protocol state
@@ -46,10 +47,21 @@ struct PHEVState
     bool connected = false;
     bool encrypted = false;
     bool sessionReady = false;
+    bool commandLifecycleActive = false;
+    bool bbSeenAfterEvAck = false;
+    bool ccSeenAfterEvAck = false;
+    bool readyCandidate = false;
 
     uint8_t currentXor = 0;
     uint8_t commandXor = 0;
     uint8_t pingXor = 0;
+    uint8_t readyCandidateCommandXor = 0;
+    uint8_t readyCandidatePingXor = 0;
+    uint8_t lockedCommandXor = 0;
+    uint8_t deferredCommandXor = 0;
+    uint8_t deferredPingXor = 0;
+    bool deferredCommandXorValid = false;
+    bool deferredPingXorValid = false;
 
     uint8_t pingCounter = 1;
     uint8_t pingResponse = 0;
@@ -57,6 +69,7 @@ struct PHEVState
     bool pendingEvUpdate = false;
 
     uint32_t lastPing = 0;
+    uint32_t readyStableSince = 0;
 
     uint8_t rxBuffer[2048];
     size_t rxLength = 0;
@@ -538,6 +551,21 @@ void parsePackets(WiFiClient &client,
             decoded.xorValue
         );
 
+        if (phev.commandLifecycleActive)
+        {
+            uint8_t afterLightsCommandXor = phev.deferredCommandXorValid
+                ? phev.deferredCommandXor
+                : phev.commandXor;
+            uint8_t afterLightsAckXor = decoded.xorValue ^ afterLightsCommandXor;
+
+            Serial.printf(
+                "PHEV AFTER LIGHTS RX cmd=%02X xor=%02X ackXor=%02X\n",
+                decoded.data[0],
+                decoded.xorValue,
+                afterLightsAckXor
+            );
+        }
+
         if (decoded.length >= 4 &&
             decoded.data[2] == 0x01 &&
             decoded.data[3] == KO_WF_EV_UPDATE_SP &&
@@ -594,15 +622,34 @@ void parsePackets(WiFiClient &client,
         }
         else if (decoded.data[0] == 0xBB && decoded.length >= 5)
         {
-            phev.commandXor = decoded.data[4];
-            phev.pingXor = decoded.data[4];
+            if (phev.commandLifecycleActive)
+            {
+                phev.deferredCommandXor = decoded.data[4];
+                phev.deferredPingXor = decoded.data[4];
+                phev.deferredCommandXorValid = true;
+                phev.deferredPingXorValid = true;
+            }
+            else
+            {
+                phev.commandXor = decoded.data[4];
+                phev.pingXor = decoded.data[4];
+            }
 
             Serial.printf(
                 "PHEV RX BB COMMAND_XOR=%02X\n",
-                phev.commandXor
+                decoded.data[4]
             );
 
-            if (phev.pendingEvUpdate)
+            if (!phev.pendingEvUpdate)
+            {
+                phev.bbSeenAfterEvAck = true;
+            }
+
+            if (phev.sessionReady)
+            {
+                Serial.println("EV_UPDATE resend skipped after session ready");
+            }
+            else if (phev.pendingEvUpdate)
             {
                 Serial.println("PHEV EV_UPDATE resend on BB");
                 phev_pipe_sendEvUpdate(client);
@@ -616,6 +663,13 @@ void parsePackets(WiFiClient &client,
                 decoded.data[3],
                 decoded.xorValue
             );
+
+            if (phev.commandLifecycleActive &&
+                decoded.data[2] == 0x01 &&
+                decoded.data[3] == 0x0A)
+            {
+                Serial.println("PHEV PCAP MATCH POINT");
+            }
 
             if (decoded.data[2] == 0x00)
             {
@@ -644,15 +698,21 @@ void parsePackets(WiFiClient &client,
                                               responseLength,
                                               decoded.xorValue);
 
+                    uint8_t ackCommandXor = phev.deferredCommandXorValid
+                        ? phev.deferredCommandXor
+                        : phev.commandXor;
+
+                    Serial.println("PHEV ACK XOR SOURCE=command");
+
                     phev_core_xorDataOutbound(responseWithMessageXor,
                                               responseEncoded,
                                               responseLength,
-                                              phev.commandXor);
+                                              ackCommandXor);
 
                     Serial.printf(
                         "PHEV TX COMMAND ACK F6 reg=%02X xor=%02X\n",
                         decoded.data[3],
-                        phev.commandXor
+                        ackCommandXor
                     );
 
                     Serial.print("TX raw: ");
@@ -680,11 +740,24 @@ void parsePackets(WiFiClient &client,
         }
         else if (decoded.data[0] == 0xCC && decoded.length >= 5)
         {
-            phev.pingXor = decoded.data[4];
+            if (phev.commandLifecycleActive)
+            {
+                phev.deferredPingXor = decoded.data[4];
+                phev.deferredPingXorValid = true;
+            }
+            else
+            {
+                phev.pingXor = decoded.data[4];
+            }
+
+            if (!phev.pendingEvUpdate)
+            {
+                phev.ccSeenAfterEvAck = true;
+            }
 
             Serial.printf(
                 "PHEV RX CC PING_XOR=%02X\n",
-                phev.pingXor
+                decoded.data[4]
             );
         }
         else if (decoded.data[0] == 0x3F && decoded.length >= 4)
@@ -697,15 +770,29 @@ void parsePackets(WiFiClient &client,
             );
         }
 
+        bool suppressCurrentXor =
+            phev.commandLifecycleActive &&
+            (decoded.data[0] == 0xBB ||
+             decoded.data[0] == 0xCC ||
+             decoded.data[0] == 0x6F ||
+             decoded.data[0] == 0x3F);
+
         if (decoded.xorValue != 0 && decoded.xorValue != phev.currentXor)
         {
-            Serial.printf(
-                "PHEV CURRENT_XOR %02X -> %02X\n",
-                phev.currentXor,
-                decoded.xorValue
-            );
+            if (suppressCurrentXor)
+            {
+                Serial.println("COMMAND WINDOW: suppress currentXor update");
+            }
+            else
+            {
+                Serial.printf(
+                    "PHEV CURRENT_XOR %02X -> %02X\n",
+                    phev.currentXor,
+                    decoded.xorValue
+                );
 
-            phev.currentXor = decoded.xorValue;
+                phev.currentXor = decoded.xorValue;
+            }
         }
 
         memmove(phev.rxBuffer,
@@ -727,11 +814,23 @@ void phev_pipe_resetConnection(PHEVState &ctx)
     ctx.connected = false;
     ctx.encrypted = false;
     ctx.sessionReady = false;
+    ctx.commandLifecycleActive = false;
+    ctx.bbSeenAfterEvAck = false;
+    ctx.ccSeenAfterEvAck = false;
+    ctx.readyCandidate = false;
     ctx.currentXor = 0;
     ctx.commandXor = 0;
     ctx.pingXor = 0;
+    ctx.readyCandidateCommandXor = 0;
+    ctx.readyCandidatePingXor = 0;
+    ctx.lockedCommandXor = 0;
+    ctx.deferredCommandXor = 0;
+    ctx.deferredPingXor = 0;
+    ctx.deferredCommandXorValid = false;
+    ctx.deferredPingXorValid = false;
     ctx.pendingEvUpdate = false;
     ctx.rxLength = 0;
+    ctx.readyStableSince = 0;
 
     phev_pipe_resetPing(ctx);
 
@@ -833,7 +932,11 @@ void phev_pipe_pingOutboundPublish(WiFiClient &client,
                                    const uint8_t *packet,
                                    size_t length)
 {
-    sendPacketWithXor(client, label, packet, length, phev.pingXor);
+    uint8_t pingTxXor = phev.commandLifecycleActive
+        ? phev.lockedCommandXor
+        : phev.pingXor;
+
+    sendPacketWithXor(client, label, packet, length, pingTxXor);
 }
 
 void phev_pipe_commandOutboundPublish(WiFiClient &client,
@@ -863,6 +966,12 @@ void phev_pipe_sendMac(WiFiClient &client, uint8_t *mac)
 
 void phev_pipe_sendEvUpdate(WiFiClient &client)
 {
+    if (phev.sessionReady)
+    {
+        Serial.println("EV_UPDATE resend skipped after session ready");
+        return;
+    }
+
     uint8_t payload = 0x03;
     uint8_t raw[8];
     uint8_t encoded[8];
@@ -914,6 +1023,9 @@ void phev_pipe_ping(WiFiClient &client)
     uint8_t encoded[8];
     size_t length = 0;
     uint8_t counter = phev.pingCounter;
+    uint8_t pingTxXor = phev.commandLifecycleActive
+        ? phev.lockedCommandXor
+        : phev.pingXor;
 
     if (!phev_core_encodeRawMessage(PING_SEND_CMD_MY18,
                                     0x00,
@@ -928,12 +1040,12 @@ void phev_pipe_ping(WiFiClient &client)
         return;
     }
 
-    phev_core_xorDataOutbound(raw, encoded, length, phev.pingXor);
+    phev_core_xorDataOutbound(raw, encoded, length, pingTxXor);
 
     Serial.printf(
         "PHEV TX PING counter=%u xor=%02X\n",
         counter,
-        phev.pingXor
+        pingTxXor
     );
 
     Serial.print("TX raw: ");
@@ -958,7 +1070,7 @@ void phev_pipe_ping(WiFiClient &client)
 
 void phev_pipe_loopMinimal(WiFiClient &client)
 {
-    if (!client.connected())
+    if (!client.connected() || phev.commandLifecycleActive)
         return;
 
     uint32_t now = millis();
@@ -972,23 +1084,103 @@ void phev_pipe_loopMinimal(WiFiClient &client)
 
 bool phev_pipe_updateSessionReady()
 {
-    if (!phev.sessionReady &&
+    if (phev.sessionReady)
+        return true;
+
+    bool readyInputsValid =
         !phev.pendingEvUpdate &&
-        phev.commandXor != 0)
+        phev.bbSeenAfterEvAck &&
+        phev.ccSeenAfterEvAck &&
+        phev.commandXor != 0 &&
+        phev.pingXor != 0;
+
+    if (!readyInputsValid)
+    {
+        phev.readyCandidate = false;
+        return false;
+    }
+
+    if (!phev.readyCandidate)
+    {
+        phev.readyCandidate = true;
+        phev.readyCandidateCommandXor = phev.commandXor;
+        phev.readyCandidatePingXor = phev.pingXor;
+        phev.readyStableSince = millis();
+
+        Serial.printf(
+            "PHEV READY CANDIDATE commandXor=%02X pingXor=%02X\n",
+            phev.commandXor,
+            phev.pingXor
+        );
+    }
+    else if (phev.commandXor != phev.readyCandidateCommandXor ||
+             phev.pingXor != phev.readyCandidatePingXor)
+    {
+        phev.readyCandidateCommandXor = phev.commandXor;
+        phev.readyCandidatePingXor = phev.pingXor;
+        phev.readyStableSince = millis();
+
+        Serial.println("PHEV READY STABLE reset");
+    }
+    else if (millis() - phev.readyStableSince >= PHEV_READY_STABLE_MS)
     {
         phev.connected = true;
         phev.encrypted = true;
         phev.sessionReady = true;
 
         Serial.printf(
-            "PHEV SESSION READY commandXor=%02X connected=%d encrypted=%d\n",
+            "PHEV SESSION READY commandXor=%02X pingXor=%02X\n",
             phev.commandXor,
-            phev.connected,
-            phev.encrypted
+            phev.pingXor
         );
     }
 
     return phev.sessionReady;
+}
+
+void phev_pipe_beginCommandLifecycle(uint8_t commandXor)
+{
+    phev.lockedCommandXor = commandXor;
+    phev.commandLifecycleActive = true;
+    phev.deferredCommandXor = 0;
+    phev.deferredPingXor = 0;
+    phev.deferredCommandXorValid = false;
+    phev.deferredPingXorValid = false;
+
+    Serial.printf(
+        "PHEV COMMAND LOCK xor=%02X\n",
+        phev.lockedCommandXor
+    );
+}
+
+void phev_pipe_endCommandLifecycle()
+{
+    if (!phev.commandLifecycleActive)
+        return;
+
+    phev.commandLifecycleActive = false;
+
+    if (phev.deferredCommandXorValid)
+    {
+        phev.commandXor = phev.deferredCommandXor;
+    }
+
+    if (phev.deferredPingXorValid)
+    {
+        phev.pingXor = phev.deferredPingXor;
+    }
+
+    Serial.printf(
+        "PHEV COMMAND WINDOW END commandXor=%02X pingXor=%02X\n",
+        phev.commandXor,
+        phev.pingXor
+    );
+
+    phev.lockedCommandXor = 0;
+    phev.deferredCommandXor = 0;
+    phev.deferredPingXor = 0;
+    phev.deferredCommandXorValid = false;
+    phev.deferredPingXorValid = false;
 }
 
 size_t readResponseToBuffer(WiFiClient &client, const char* label, int waitMs, uint8_t* buffer, size_t maxLen) 
@@ -1157,13 +1349,11 @@ void warmupSession(WiFiClient &client) {
   Serial.println("WARMUP DONE");
 }
 
-void sendXorCommandPair(WiFiClient &client, bool lightsOn)
+void sendXorCommandPair(WiFiClient &client,
+                        bool lightsOn,
+                        uint8_t commandXor)
 {
     uint8_t buffer[1024];
-
-    uint8_t rawPing[] = {
-        0xF6, 0x04, 0x00, 0x06, 0x03, 0x03
-    };
 
     uint8_t rawLightsOn[] = {
         0xF6, 0x04, 0x00, 0x0A, 0x01, 0x05
@@ -1173,34 +1363,16 @@ void sendXorCommandPair(WiFiClient &client, bool lightsOn)
         0xF6, 0x04, 0x00, 0x0A, 0x02, 0x06
     };
 
-    Serial.printf("USING COMMAND_XOR=%02X\n", phev.commandXor);
+    Serial.printf("USING COMMAND_XOR=%02X\n", commandXor);
 
-    Serial.printf(
-        "PHEV TX PING counter=%u pingXor=%02X\n",
-        phev.pingCounter,
-        phev.pingXor
-    );
+    phev_pipe_beginCommandLifecycle(commandXor);
 
-    phev_pipe_pingOutboundPublish(
-        client,
-        "SEND XOR PING",
-        rawPing,
-        sizeof(rawPing)
-    );
-
-    readResponseToBuffer(
-        client,
-        "RESP XOR PING",
-        1200,
-        buffer,
-        sizeof(buffer)
-    );
-
-    phev_pipe_commandOutboundPublish(
+    sendPacketWithXor(
         client,
         lightsOn ? "SEND XOR LIGHTS ON" : "SEND XOR LIGHTS OFF",
         lightsOn ? rawLightsOn : rawLightsOff,
-        sizeof(rawLightsOn)
+        sizeof(rawLightsOn),
+        phev.lockedCommandXor
     );
 
     readResponseToBuffer(
@@ -1251,14 +1423,17 @@ while (millis() < endTime)
 
     if(phev.sessionReady && !commandSent)
     {
+        const uint8_t commandTxXor = phev.commandXor;
+
         Serial.printf(
-            "\nSESSION READY COMMAND_XOR=%02X\n",
-            phev.commandXor
+            "PHEV COMMAND WINDOW READY commandXor=%02X\n",
+            commandTxXor
         );
 
         sendXorCommandPair(
             client,
-            lightsOn
+            lightsOn,
+            commandTxXor
         );
 
         commandSent = true;
@@ -1269,6 +1444,7 @@ while (millis() < endTime)
     delay(50);
 }
 
+phev_pipe_endCommandLifecycle();
 client.stop();
 phev.connected = false;
 Serial.printf(
