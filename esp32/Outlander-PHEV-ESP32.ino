@@ -1363,6 +1363,7 @@ void sendHeadlightsOn() {
   sendHeadlightsCommand(true);
 }
 
+// LIGHTS_OFF is currently untested and not needed; do not use until tested separately.
 void sendHeadlightsOff() {
   sendHeadlightsCommand(false);
 }
