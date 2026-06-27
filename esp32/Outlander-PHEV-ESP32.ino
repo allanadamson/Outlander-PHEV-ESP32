@@ -88,7 +88,8 @@ void sendPacketWithXor(WiFiClient &client,
                        const char* label,
                        const uint8_t* packet,
                        size_t len,
-                       uint8_t xorValue);
+                       uint8_t xorValue,
+                       bool logPacket = true);
 void phev_pipe_sendEvUpdate(WiFiClient &client);
 void phev_pipe_ping(WiFiClient &client);
 void phev_pipe_loopMinimal(WiFiClient &client);
@@ -355,82 +356,6 @@ bool phev_core_extractAndDecodeIncomingMessageAndXORBounded(const uint8_t *data,
     return true;
 }
 
-void phev_logRawMarkers(const uint8_t *buffer,
-                        size_t length,
-                        size_t baseOffset)
-{
-    for (size_t i = 0; i < length; i++)
-    {
-        switch (buffer[i])
-        {
-            case 0xBB:
-            case 0xCC:
-            case 0xCD:
-            case 0xBA:
-            case 0x2F:
-            {
-                size_t markerOffset = baseOffset + i;
-                size_t windowStart = (i > 16) ? i - 16 : 0;
-                size_t windowEnd = i + 33;
-
-                if (windowEnd > length)
-                    windowEnd = length;
-
-                Serial.printf(
-                    "RX RAW MARKER %02X at %u\n",
-                    buffer[i],
-                    (unsigned)markerOffset
-                );
-
-                Serial.printf(
-                    "RX MARKER WINDOW marker=%02X pos=%u:\n",
-                    buffer[i],
-                    (unsigned)markerOffset
-                );
-
-                for (size_t j = windowStart; j < windowEnd; j++)
-                {
-                    Serial.printf("%02X ", buffer[j]);
-                }
-                Serial.println();
-
-                if (i + 2 < length)
-                {
-                    uint8_t data0 = buffer[i];
-                    uint8_t data1 = buffer[i + 1];
-                    uint8_t data2 = buffer[i + 2];
-                    uint8_t xorCandidate = data2;
-                    uint8_t xorCandidateAlt = xorCandidate ^ 1;
-                    uint16_t plainLen = (uint16_t)data1 + 2;
-                    uint8_t decodedCommand = data0 ^ xorCandidate;
-                    uint16_t decodedLen = (uint16_t)(data1 ^ xorCandidate) + 2;
-                    uint8_t decodedCommandAlt = data0 ^ xorCandidateAlt;
-                    uint16_t decodedLenAlt = (uint16_t)(data1 ^ xorCandidateAlt) + 2;
-
-                    Serial.printf("RX MARKER data[0]=%02X\n", data0);
-                    Serial.printf("RX MARKER data[1]=%02X\n", data1);
-                    Serial.printf("RX MARKER data[2]=%02X\n", data2);
-                    Serial.printf("RX MARKER plainLen=%u\n", (unsigned)plainLen);
-                    Serial.printf("RX MARKER xorCandidate=%02X\n", xorCandidate);
-                    Serial.printf("RX MARKER decodedCommand=%02X\n", decodedCommand);
-                    Serial.printf("RX MARKER decodedLen=%u\n", (unsigned)decodedLen);
-                    Serial.printf("RX MARKER decodedCommandAlt=%02X\n", decodedCommandAlt);
-                    Serial.printf("RX MARKER decodedLenAlt=%u\n", (unsigned)decodedLenAlt);
-                }
-                else
-                {
-                    Serial.println("RX MARKER candidate bytes incomplete");
-                }
-
-                break;
-            }
-
-            default:
-                break;
-        }
-    }
-}
-
 bool phev_rxLooksPartialPacket(const uint8_t *buffer,
                                size_t length)
 {
@@ -468,8 +393,6 @@ void parsePackets(WiFiClient &client,
 {
     if (length == 0)
         return;
-
-    phev_logRawMarkers(buffer, length, phev.rxLength);
 
     if (length > sizeof(phev.rxBuffer))
     {
@@ -759,6 +682,7 @@ void parsePackets(WiFiClient &client,
                 "PHEV RX CC PING_XOR=%02X\n",
                 decoded.data[4]
             );
+
         }
         else if (decoded.data[0] == 0x3F && decoded.length >= 4)
         {
@@ -880,7 +804,8 @@ void sendPacketWithXor(WiFiClient &client,
                        const char* label,
                        const uint8_t* packet,
                        size_t len,
-                       uint8_t xorValue)
+                       uint8_t xorValue,
+                       bool logPacket)
 {
     uint8_t out[64];
 
@@ -893,22 +818,26 @@ void sendPacketWithXor(WiFiClient &client,
     {
         phev_core_xorDataOutbound(packet, out, len, xorValue);
 
-        Serial.printf("TX XOR=%02X\n", xorValue);
+        if (logPacket)
+            Serial.printf("TX XOR=%02X\n", xorValue);
     }
 
-    Serial.print(label);
-    Serial.print(": ");
-
-    for (size_t i = 0; i < len; i++)
+    if (logPacket)
     {
-        if (out[i] < 0x10)
-            Serial.print("0");
+        Serial.print(label);
+        Serial.print(": ");
 
-        Serial.print(out[i], HEX);
-        Serial.print(" ");
+        for (size_t i = 0; i < len; i++)
+        {
+            if (out[i] < 0x10)
+                Serial.print("0");
+
+            Serial.print(out[i], HEX);
+            Serial.print(" ");
+        }
+
+        Serial.println();
     }
-
-    Serial.println();
 
     client.write(out, len);
     client.flush();
@@ -930,13 +859,14 @@ void phev_pipe_outboundPublish(WiFiClient &client,
 void phev_pipe_pingOutboundPublish(WiFiClient &client,
                                    const char* label,
                                    const uint8_t *packet,
-                                   size_t length)
+                                   size_t length,
+                                   bool logPacket)
 {
     uint8_t pingTxXor = phev.commandLifecycleActive
         ? phev.lockedCommandXor
         : phev.pingXor;
 
-    sendPacketWithXor(client, label, packet, length, pingTxXor);
+    sendPacketWithXor(client, label, packet, length, pingTxXor, logPacket);
 }
 
 void phev_pipe_commandOutboundPublish(WiFiClient &client,
@@ -1020,12 +950,8 @@ void phev_pipe_ping(WiFiClient &client)
 {
     uint8_t payload = 0x00;
     uint8_t raw[8];
-    uint8_t encoded[8];
     size_t length = 0;
     uint8_t counter = phev.pingCounter;
-    uint8_t pingTxXor = phev.commandLifecycleActive
-        ? phev.lockedCommandXor
-        : phev.pingXor;
 
     if (!phev_core_encodeRawMessage(PING_SEND_CMD_MY18,
                                     0x00,
@@ -1040,29 +966,7 @@ void phev_pipe_ping(WiFiClient &client)
         return;
     }
 
-    phev_core_xorDataOutbound(raw, encoded, length, pingTxXor);
-
-    Serial.printf(
-        "PHEV TX PING counter=%u xor=%02X\n",
-        counter,
-        pingTxXor
-    );
-
-    Serial.print("TX raw: ");
-    for (size_t i = 0; i < length; i++)
-    {
-        Serial.printf("%02X ", raw[i]);
-    }
-    Serial.println();
-
-    Serial.print("TX encoded: ");
-    for (size_t i = 0; i < length; i++)
-    {
-        Serial.printf("%02X ", encoded[i]);
-    }
-    Serial.println();
-
-    phev_pipe_pingOutboundPublish(client, "PING", raw, length);
+    phev_pipe_pingOutboundPublish(client, "PING", raw, length, false);
 
     phev.pingCounter++;
     phev.pingCounter %= 0x30;
@@ -1326,7 +1230,7 @@ void sendRawPingAndRead(WiFiClient &client, int waitMs) {
     phev.pingXor
   );
 
-  phev_pipe_pingOutboundPublish(client, "SEND RAW PING", rawPing, sizeof(rawPing));
+  phev_pipe_pingOutboundPublish(client, "SEND RAW PING", rawPing, sizeof(rawPing), true);
   readResponseToBuffer(client, "RESP RAW PING", waitMs, buffer, sizeof(buffer));
 }
 
