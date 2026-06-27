@@ -35,6 +35,7 @@ uint8_t registered_mac[] = {
 #define KO_WF_EV_UPDATE_SP 0x06
 #define PING_SEND_CMD_MY18 0xF3
 #define PHEV_PING_INTERVAL_MS 1000
+#define PHEV_HANDSHAKE_WAIT_MS 10000
 
 // =====================================================
 // PHEV protocol state
@@ -44,6 +45,7 @@ struct PHEVState
 {
     bool connected = false;
     bool encrypted = false;
+    bool sessionReady = false;
 
     uint8_t currentXor = 0;
     uint8_t commandXor = 0;
@@ -213,23 +215,18 @@ bool phev_core_startMessageEncoded(const uint8_t *mac,
                                    size_t outputSize,
                                    size_t &outputLength)
 {
-    uint8_t startPayload[7];
-    memcpy(startPayload, mac, 6);
-    startPayload[6] = 0;
+    (void)mac;
 
-    size_t startLength = 0;
+    const uint8_t startMessage[] = {
+        0xF2, 0x0A, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0xFD
+    };
 
-    if (!phev_core_encodeRawMessage(0xE5,
-                                    0x00,
-                                    0x01,
-                                    startPayload,
-                                    sizeof(startPayload),
-                                    output,
-                                    outputSize,
-                                    startLength))
-    {
+    if (sizeof(startMessage) > outputSize)
         return false;
-    }
+
+    memcpy(output, startMessage, sizeof(startMessage));
+    size_t startLength = sizeof(startMessage);
 
     const uint8_t aaPayload = 0;
     size_t aaLength = 0;
@@ -729,6 +726,7 @@ void phev_pipe_resetConnection(PHEVState &ctx)
 {
     ctx.connected = false;
     ctx.encrypted = false;
+    ctx.sessionReady = false;
     ctx.currentXor = 0;
     ctx.commandXor = 0;
     ctx.pingXor = 0;
@@ -911,12 +909,6 @@ void phev_pipe_sendEvUpdate(WiFiClient &client)
 
 void phev_pipe_ping(WiFiClient &client)
 {
-    if (phev.encrypted && phev.pingXor == 0)
-    {
-        Serial.println("PHEV PING skipped waiting for pingXor");
-        return;
-    }
-
     uint8_t payload = 0x00;
     uint8_t raw[8];
     uint8_t encoded[8];
@@ -976,6 +968,27 @@ void phev_pipe_loopMinimal(WiFiClient &client)
         phev.lastPing = now;
         phev_pipe_ping(client);
     }
+}
+
+bool phev_pipe_updateSessionReady()
+{
+    if (!phev.sessionReady &&
+        !phev.pendingEvUpdate &&
+        phev.commandXor != 0)
+    {
+        phev.connected = true;
+        phev.encrypted = true;
+        phev.sessionReady = true;
+
+        Serial.printf(
+            "PHEV SESSION READY commandXor=%02X connected=%d encrypted=%d\n",
+            phev.commandXor,
+            phev.connected,
+            phev.encrypted
+        );
+    }
+
+    return phev.sessionReady;
 }
 
 size_t readResponseToBuffer(WiFiClient &client, const char* label, int waitMs, uint8_t* buffer, size_t maxLen) 
@@ -1079,36 +1092,32 @@ void sendPhevInit(WiFiClient &client) {
 
   phev_pipe_sendMac(client, registered_mac);
   phev_pipe_sendEvUpdate(client);
-  readResponseToBuffer(client, "RESP START", 3000, buffer, sizeof(buffer));
 
-  unsigned long endTime = millis() + 7000;
+  phev_pipe_ping(client);
+  phev.lastPing = millis();
 
-  while (millis() < endTime && phev.commandXor == 0)
+  unsigned long endTime = millis() + PHEV_HANDSHAKE_WAIT_MS;
+
+  while (millis() < endTime && !phev.sessionReady)
   {
+    phev_pipe_loopMinimal(client);
+
     if (client.available())
     {
-      readResponseToBuffer(client, "RESP HANDSHAKE", 500, buffer, sizeof(buffer));
+      readResponseToBuffer(client, "RESP HANDSHAKE", 100, buffer, sizeof(buffer));
     }
 
-    delay(50);
+    phev_pipe_updateSessionReady();
+    delay(10);
   }
 
-  if (phev.commandXor != 0)
+  if (!phev_pipe_updateSessionReady())
   {
-    phev.connected = true;
-    phev.encrypted = true;
-
     Serial.printf(
-      "PHEV HANDSHAKE OK COMMAND_XOR=%02X PING_XOR=%02X connected=%d encrypted=%d\n",
-      phev.commandXor,
-      phev.pingXor,
-      phev.connected,
-      phev.encrypted
+      "PHEV SESSION NOT READY pendingEvUpdate=%d commandXor=%02X\n",
+      phev.pendingEvUpdate,
+      phev.commandXor
     );
-  }
-  else
-  {
-    Serial.println("PHEV HANDSHAKE WAITING FOR BB/CC");
   }
 }
 
@@ -1219,7 +1228,7 @@ void sendHeadlightsCommand(bool lightsOn) {
 
 Serial.println("INIT DONE - WATCHING");
 
-bool xorSent = false;
+bool commandSent = false;
 
 unsigned long endTime = millis() + 60000;
 
@@ -1238,10 +1247,12 @@ while (millis() < endTime)
         );
     }
 
-    if(phev.commandXor != 0 && !xorSent)
+    phev_pipe_updateSessionReady();
+
+    if(phev.sessionReady && !commandSent)
     {
         Serial.printf(
-            "\nFOUND XOR %02X\n",
+            "\nSESSION READY COMMAND_XOR=%02X\n",
             phev.commandXor
         );
 
@@ -1250,7 +1261,9 @@ while (millis() < endTime)
             lightsOn
         );
 
-        xorSent = true;
+        commandSent = true;
+        endTime = millis() + 5000;
+        Serial.println("PHEV command sent, keeping TCP open for 5 seconds");
     }
 
     delay(50);
