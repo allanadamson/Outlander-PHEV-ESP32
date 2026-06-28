@@ -1368,14 +1368,119 @@ void sendHeadlightsOff() {
   sendHeadlightsCommand(false);
 }
 
+void sendXorAcCommand(WiFiClient &client,
+                      bool acOn,
+                      uint8_t commandXor)
+{
+    uint8_t buffer[1024];
+
+    uint8_t rawAcOn[] = {
+        0xF6, 0x04, 0x00, 0x04, 0x02, 0x00
+    };
+
+    uint8_t rawAcOff[] = {
+        0xF6, 0x04, 0x00, 0x04, 0x01, 0xFF
+    };
+
+    Serial.printf("USING COMMAND_XOR=%02X\n", commandXor);
+
+    phev_pipe_beginCommandLifecycle(commandXor);
+
+    sendPacketWithXor(
+        client,
+        acOn ? "SEND XOR AC ON" : "SEND XOR AC OFF",
+        acOn ? rawAcOn : rawAcOff,
+        sizeof(rawAcOn),
+        phev.lockedCommandXor
+    );
+
+    readResponseToBuffer(
+        client,
+        acOn ? "RESP XOR AC ON" : "RESP XOR AC OFF",
+        1800,
+        buffer,
+        sizeof(buffer)
+    );
+}
+
+void sendAcCommand(bool acOn) {
+  Serial.println(acOn ? "\n--- AC ON ---" : "\n--- AC OFF ---");
+
+  WiFiClient client;
+  uint8_t buffer[1024];
+
+  phev_pipe_resetConnection(phev);
+
+  if (!connectCarTcp(client)) return;
+
+  Serial.println("TRACE: before sendPhevInit()");
+  sendPhevInit(client);
+  Serial.println("TRACE: after sendPhevInit()");
+
+Serial.println("INIT DONE - WATCHING");
+
+bool commandSent = false;
+
+unsigned long endTime = millis() + 60000;
+
+while (millis() < endTime)
+{
+    phev_pipe_loopMinimal(client);
+
+    if(client.available())
+    {
+        readResponseToBuffer(
+            client,
+            "ASYNC",
+            100,
+            buffer,
+            sizeof(buffer)
+        );
+    }
+
+    phev_pipe_updateSessionReady();
+
+    if(phev.sessionReady && !commandSent)
+    {
+        const uint8_t commandTxXor = phev.commandXor;
+
+        Serial.printf(
+            "PHEV COMMAND WINDOW READY commandXor=%02X\n",
+            commandTxXor
+        );
+
+        sendXorAcCommand(
+            client,
+            acOn,
+            commandTxXor
+        );
+
+        commandSent = true;
+        endTime = millis() + 5000;
+        Serial.println("PHEV command sent, keeping TCP open for 5 seconds");
+    }
+
+    delay(50);
+}
+
+phev_pipe_endCommandLifecycle();
+client.stop();
+phev.connected = false;
+Serial.printf(
+    "PHEV STATE connected=%d encrypted=%d\n",
+    phev.connected,
+    phev.encrypted
+);
+Serial.println("TCP CLOSED");
+return;
+}
+
 void handleAcOn() {
-  Serial.println("\n--- AC ON ---");
-  Serial.println("AC command not implemented yet");
+  sendAcCommand(true);
 }
 
 void handleAcOff() {
-  Serial.println("\n--- AC OFF ---");
-  Serial.println("AC command not implemented yet");
+  sendAcCommand(false);
 }
 
 void subscribeMQTT() {
