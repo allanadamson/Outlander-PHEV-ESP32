@@ -1368,6 +1368,16 @@ void sendHeadlightsOff() {
   sendHeadlightsCommand(false);
 }
 
+void handleAcOn() {
+  Serial.println("\n--- AC ON ---");
+  Serial.println("AC command not implemented yet");
+}
+
+void handleAcOff() {
+  Serial.println("\n--- AC OFF ---");
+  Serial.println("AC command not implemented yet");
+}
+
 void subscribeMQTT() {
   Serial.println("\n--- MQTT SUBSCRIBE ---");
 
@@ -1482,6 +1492,10 @@ void handleModemData(String resp) {
   } else if (resp.indexOf("LIGHTS_OFF") != -1) {
     Serial.println("\n[KÄSK] LIGHTS OFF");
     sendHeadlightsOff();
+  } else if (resp.indexOf("AC ON") != -1 || resp.indexOf("AC_ON") != -1) {
+    handleAcOn();
+  } else if (resp.indexOf("AC OFF") != -1 || resp.indexOf("AC_OFF") != -1) {
+    handleAcOff();
   } else if (resp.indexOf("CONNLOST") != -1 || resp.indexOf("CLOSED") != -1) {
     Serial.println("\nMQTT CONNECTION LOST");
     connectToMQTT();
@@ -1541,6 +1555,10 @@ void loop() {
     } else if (usbCmd == "LIGHTS_OFF") {
       Serial.println("\n[USB TEST] LIGHTS OFF");
       sendHeadlightsOff();
+    } else if (usbCmd == "AC ON" || usbCmd == "AC_ON") {
+      handleAcOn();
+    } else if (usbCmd == "AC OFF" || usbCmd == "AC_OFF") {
+      handleAcOff();
     } else {
       Serial2.print(usbCmd);
       Serial2.print("\n");
