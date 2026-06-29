@@ -76,6 +76,7 @@ struct PHEVState
 };
 
 PHEVState phev;
+bool statusTestActive = false;
 
 struct PhevCoreMessage
 {
@@ -586,6 +587,22 @@ void parsePackets(WiFiClient &client,
                 decoded.data[3],
                 decoded.xorValue
             );
+
+            if (statusTestActive)
+            {
+                Serial.printf(
+                    "STATUS RX 6F reg=%02X type=%02X len=%02X payload=",
+                    decoded.data[3],
+                    decoded.data[2],
+                    decoded.length
+                );
+
+                for (size_t i = 4; i + 1 < decoded.length; i++)
+                {
+                    Serial.printf("%02X", decoded.data[i]);
+                }
+                Serial.println();
+            }
 
             if (phev.commandLifecycleActive &&
                 decoded.data[2] == 0x01 &&
@@ -1483,6 +1500,86 @@ void handleAcOff() {
   sendAcCommand(false);
 }
 
+void handleStatusTest() {
+  Serial.println("\n--- STATUS TEST ---");
+
+  WiFiClient client;
+  uint8_t buffer[1024];
+
+  statusTestActive = true;
+
+  phev_pipe_resetConnection(phev);
+
+  if (!connectCarTcp(client))
+  {
+    statusTestActive = false;
+    return;
+  }
+
+  Serial.println("TRACE: before sendPhevInit()");
+  sendPhevInit(client);
+  Serial.println("TRACE: after sendPhevInit()");
+
+  bool statusReadyLogged = false;
+  unsigned long readyWaitEndTime = millis() + 30000;
+
+  while (client.connected() &&
+         !phev.sessionReady &&
+         millis() < readyWaitEndTime)
+  {
+    phev_pipe_loopMinimal(client);
+
+    if (client.available())
+    {
+      readResponseToBuffer(
+          client,
+          "STATUS ASYNC",
+          100,
+          buffer,
+          sizeof(buffer)
+      );
+    }
+
+    phev_pipe_updateSessionReady();
+    delay(50);
+  }
+
+  if (phev.sessionReady)
+  {
+    Serial.println("STATUS SESSION READY");
+    statusReadyLogged = true;
+  }
+
+  if (statusReadyLogged)
+  {
+    unsigned long listenEndTime = millis() + 30000;
+
+    while (client.connected() && millis() < listenEndTime)
+    {
+      phev_pipe_loopMinimal(client);
+
+      if (client.available())
+      {
+        readResponseToBuffer(
+            client,
+            "STATUS ASYNC",
+            100,
+            buffer,
+            sizeof(buffer)
+        );
+      }
+
+      phev_pipe_updateSessionReady();
+      delay(50);
+    }
+  }
+
+  statusTestActive = false;
+  client.stop();
+  phev.connected = false;
+  Serial.println("TCP CLOSED");
+}
+
 void subscribeMQTT() {
   Serial.println("\n--- MQTT SUBSCRIBE ---");
 
@@ -1664,6 +1761,8 @@ void loop() {
       handleAcOn();
     } else if (usbCmd == "AC OFF" || usbCmd == "AC_OFF") {
       handleAcOff();
+    } else if (usbCmd == "STATUS_TEST" || usbCmd == "S") {
+      handleStatusTest();
     } else {
       Serial2.print(usbCmd);
       Serial2.print("\n");
