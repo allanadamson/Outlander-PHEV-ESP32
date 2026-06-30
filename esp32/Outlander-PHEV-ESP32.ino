@@ -10,8 +10,11 @@ const char* auto_ssid = "REMOTE57zerv";
 const char* auto_pass = "JfxSFvXFeM72C5";
 
 // MQTT server
-const char* server_ip = "213.35.245.246";
-const char* mqtt_topic = "auto/outlander/cmd";
+const char* MQTT_HOST = "w72171a4.ala.eu-central-1.emqxsl.com";
+const int MQTT_PORT = 8883;
+const char* MQTT_USER = "allan";
+const char* MQTT_PASS = "SINU_EMQX_PAROOL";
+const char* MQTT_TOPIC = "auto/outlander/cmd";
 
 // Auto IP ja port
 IPAddress auto_IP(192, 168, 8, 46);
@@ -765,8 +768,14 @@ void phev_pipe_resetConnection(PHEVState &ctx)
     );
 }
 
-String sendAT(String cmd, int wait = 1500) {
+String sendAT(String cmd, int wait = 1500, bool hideCommand = false) {
   String response = "";
+  bool redact =
+    hideCommand ||
+    cmd.indexOf("PASSWORD") != -1 ||
+    (cmd.indexOf("CMQTTCONNECT") != -1 &&
+     cmd.indexOf(MQTT_PASS) != -1);
+
   Serial2.println(cmd);
 
   unsigned long timeout = millis() + wait;
@@ -775,13 +784,18 @@ String sendAT(String cmd, int wait = 1500) {
     while (Serial2.available()) {
       response += (char)Serial2.read();
     }
+
+    if (cmd.indexOf("AT+CMQTTCONNECT=") == 0 &&
+        response.indexOf("ERROR") != -1) {
+      break;
+    }
   }
 
   Serial.println("================================");
   Serial.println("AT COMMAND:");
-  Serial.println(cmd);
+  Serial.println(redact ? "<redacted>" : cmd);
   Serial.println("RESPONSE:");
-  Serial.println(response);
+  Serial.println(redact ? "<redacted>" : response);
   Serial.println("================================");
 
   return response;
@@ -1486,10 +1500,15 @@ void handleAcOff() {
 void subscribeMQTT() {
   Serial.println("\n--- MQTT SUBSCRIBE ---");
 
-  sendAT("AT+CMQTTSUBTOPIC=0,18,0", 2000);
+  String subscribeTopicCmd =
+    "AT+CMQTTSUBTOPIC=0," +
+    String(strlen(MQTT_TOPIC)) +
+    ",0";
+
+  sendAT(subscribeTopicCmd, 2000);
   delay(500);
 
-  Serial2.print(mqtt_topic);
+  Serial2.print(MQTT_TOPIC);
   delay(500);
 
   String resp = sendAT("AT+CMQTTSUB=0", 5000);
@@ -1502,18 +1521,43 @@ void subscribeMQTT() {
 }
 
 void connectToMQTT() {
-  Serial.println("TRACE: connectToMQTT() begin");
-  Serial.println("\n--- MQTT CONNECT ---");
+  Serial.println("\nMQTT CONNECT EMQX TLS");
 
-  sendAT("AT+CMQTTSTART", 5000);
-  sendAT("AT+CMQTTACCQ=0,\"ESP32A\",0", 3000);
-
-  String cmd =
+  String connectCmd =
     "AT+CMQTTCONNECT=0,\"tcp://" +
-    String(server_ip) +
-    ":1883\",60,1";
+    String(MQTT_HOST) +
+    ":" +
+    String(MQTT_PORT) +
+    "\",60,1,\"" +
+    String(MQTT_USER) +
+    "\",\"" +
+    String(MQTT_PASS) +
+    "\"";
 
-  String resp = sendAT(cmd, 10000);
+  String resp = "";
+
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      sendAT("AT+CMQTTREL=0", 3000);
+      sendAT("AT+CMQTTSTOP", 5000);
+      delay(1000);
+    }
+
+    sendAT("AT+CMQTTSTART", 5000);
+    sendAT("AT+CMQTTACCQ=0,\"ESP32A\",1", 3000);
+    sendAT("AT+CSSLCFG=\"sslversion\",0,4", 3000);
+    sendAT("AT+CSSLCFG=\"authmode\",0,0", 3000);
+    sendAT("AT+CSSLCFG=\"ignorelocaltime\",0,1", 3000);
+    sendAT("AT+CSSLCFG=\"enableSNI\",0,1", 3000);
+    sendAT("AT+CMQTTSSLCFG=0,0", 3000);
+
+    resp = sendAT(connectCmd, 60000, true);
+
+    if (resp.indexOf("+CMQTTCONNECT: 0,0") != -1 ||
+        resp.indexOf("ERROR") == -1) {
+      break;
+    }
+  }
 
   if (resp.indexOf("+CMQTTCONNECT: 0,0") != -1) {
     Serial.println("MQTT CONNECT OK");
@@ -1521,8 +1565,6 @@ void connectToMQTT() {
   } else {
     Serial.println("MQTT CONNECT FAIL");
   }
-
-  Serial.println("TRACE: connectToMQTT() end");
 }
 
 void testTCPPort() {
@@ -1587,9 +1629,20 @@ void connectToCarWiFi() {
 }
 
 void handleModemData(String resp) {
-  Serial.println("\n===== MODEM DATA =====");
-  Serial.println(resp);
-  Serial.println("======================");
+  String mqttPayload = resp;
+  int payloadMarker = resp.indexOf("+CMQTTRXPAYLOAD:");
+
+  if (payloadMarker != -1) {
+    int payloadStart = resp.indexOf('\n', payloadMarker);
+
+    if (payloadStart != -1) {
+      mqttPayload = resp.substring(payloadStart + 1);
+    }
+  }
+
+  mqttPayload.trim();
+  Serial.print("MQTT RX: ");
+  Serial.println(mqttPayload);
 
   if (resp.indexOf("LIGHTS_ON") != -1) {
     Serial.println("\n[KÄSK] LIGHTS ON");
